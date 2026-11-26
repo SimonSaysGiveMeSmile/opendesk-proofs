@@ -1,0 +1,182 @@
+# THE CREDIT of a closed pull request: tell the desk.
+#
+#   merged  -> POST <desk>/accepted {board, gap, handle: the pull request's author, pr: its address}
+#   closed without a merge -> POST <desk>/rejected {board, gap, pr: its address, reason:
+#              pull_request_closed} for a file under lean/OpenDesk/Outside/, statements/ or
+#              witnesses/, so the desk frees the gap at once instead of holding it "in review" for
+#              72 hours. Only when the desk's review of that gap names THIS pull request (so closing
+#              an unrelated pull request can never hand back a gap someone else is being reviewed
+#              for). The desk (lib/app.js, lib/desk.js rejected()) reads gap, board and reason; pr
+#              is sent so the call names the pull request it is for.
+#
+# Runs on pull_request_target, so this file and every script it runs are the BASE branch's. It
+# never checks out, builds or runs the pull request: it reads the pull request, its file list and
+# the tree of its head through the API, as data. It holds the desk's admin token
+# (secrets.OPENDESK_ADMIN_TOKEN), which is why nothing of the pull request runs here.
+#
+# A proof (lean/OpenDesk/Outside/<gap id>.lean) is credited only when the check that counts
+# accepted it: the commit status `opendesk/check` on the merged head is `success`, set by
+# verdict.yml (github-actions[bot]), saying `ACCEPTED <gap id>`, AND the pull request carries the
+# label opendesk:accepted. A statement (statements/) or a witness (witnesses/) is reviewed by a
+# person, and the merge is that person's approval: it is credited the same way.
+#
+# Adapted from open-goat/pequalnp-proofs (Apache-2.0): its base-only pattern (outside-guard.yml,
+# land-by-push.yml: scripts taken from the base commit by git plumbing, nothing of the pull
+# request on disk but data).
+name: credit
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: read
+
+concurrency:
+  group: credit-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  credit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PR: ${{ github.event.pull_request.number }}
+      MERGED: ${{ github.event.pull_request.merged }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      GH_TOKEN: ${{ github.token }}
+      GAPS_URL: ${{ vars.OPENDESK_GAPS_URL || 'https://www.1proof.site/desk/gaps.json' }}
+      DESK_URL: ${{ vars.OPENDESK_DESK_URL || 'https://www.1proof.site/desk' }}
+    steps:
+      - name: Take OUR scripts from the base commit (plain git, no stored credentials)
+        run: |
+          set -eu
+          case "$PR" in ''|*[!0-9]*) echo "REFUSED: bad pull request number"; exit 1 ;; esac
+          case "$MERGED" in true|false) ;; *) echo "REFUSED: bad merged flag"; exit 1 ;; esac
+          # The desk's address: https, a plain host, a plain path, nothing else (no query, no user@).
+          printf '%s' "$DESK_URL" | grep -Eqx 'https://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?(/[A-Za-z0-9._~-]{1,64}){0,4}' || { echo "REFUSED: OPENDESK_DESK_URL is not a plain https address"; exit 1; }
+          git init -q "$RUNNER_TEMP/base"
+          git -C "$RUNNER_TEMP/base" fetch -q --depth 1 --filter=blob:none "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          mkdir -p "$RUNNER_TEMP/scripts" "$RUNNER_TEMP/in"
+          git -C "$RUNNER_TEMP/base" show "$GITHUB_SHA:.github/scripts/outside-guard.mjs" > "$RUNNER_TEMP/scripts/outside-guard.mjs"
+
+      - name: The pull request, read through the API, and its gap
+        id: pr
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/in"; g="$RUNNER_TEMP/scripts/outside-guard.mjs"
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}" > "$d/pr.json"
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files?per_page=3" > "$d/files.json"
+          head=$(node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); process.stdout.write(String(p?.head?.sha??""))' "$d/pr.json")
+          printf '%s' "$head" | grep -Eqx '[0-9a-f]{40}' || { echo "REFUSED: the pull request has no head commit"; exit 1; }
+          gh api "repos/${GITHUB_REPOSITORY}/git/trees/${head}?recursive=1" > "$d/tree.json"
+          # A merged file's gap may already be in the desk's checked list (a re-run after the desk
+          # recorded it); a closed one's must still be open on the desk to be handed back.
+          if [ "$MERGED" = true ]; then mode=merged; gapmode=gap-of-merged-file; else mode=closed; gapmode=gap-of-file; fi
+          # A pull request that is not one gap's one file is no job of the desk: nothing to tell it.
+          if ! node "$g" "$mode" "$d/pr.json" "$d/files.json" "$d/tree.json" "$GITHUB_REPOSITORY" "$DEFAULT_BRANCH" "$d"; then
+            echo "not a desk pull request; the desk is not told"; echo "tell=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          curl -sSf --proto '=https' --max-redirs 0 --max-filesize 20000000 -o "$d/gaps.json" "$GAPS_URL"
+          if ! node "$g" "$gapmode" "$d/gaps.json" "$(cat "$d/pr.file")" "$d"; then
+            echo "the desk posts no gap for this file; the desk is not told"; echo "tell=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # The pull request's address, as the desk takes it.
+          url=$(node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); process.stdout.write(String(p?.html_url??""))' "$d/pr.json")
+          printf '%s' "$url" | grep -Eqx "https://github\.com/${GITHUB_REPOSITORY}/pull/${PR}" || { echo "REFUSED: unexpected pull request address"; exit 1; }
+          printf '%s\n' "$url" > "$d/pr.url"
+          echo "tell=yes" >> "$GITHUB_OUTPUT"
+          echo "gap: $(cat "$d/gap.id")  kind: $(cat "$d/gap.kind")  file: $(cat "$d/pr.file")  author: $(cat "$d/pr.author")"
+
+      - name: A proof is credited only when the check that counts accepted it
+        id: ok
+        if: steps.pr.outputs.tell == 'yes' && env.MERGED == 'true'
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/in"
+          kind=$(cat "$d/gap.kind"); gap=$(cat "$d/gap.id"); head=$(cat "$d/pr.head")
+          case "$kind" in
+            state|compute) echo "a $kind job: the merge is the reviewer's approval"; echo "credit=yes" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          labels=$(node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); process.stdout.write((p?.labels??[]).map((l)=>String(l?.name??"")).join("\n"))' "$d/pr.json")
+          printf '%s\n' "$labels" | grep -qx 'opendesk:accepted' || { echo "NOT CREDITED: the pull request does not carry opendesk:accepted"; echo "credit=no" >> "$GITHUB_OUTPUT"; exit 1; }
+          # The newest opendesk/check status on the merged head (the API lists the newest first).
+          gh api "repos/${GITHUB_REPOSITORY}/commits/${head}/statuses?per_page=100" > "$d/statuses.json"
+          node -e '
+            const [f, gap] = process.argv.slice(1);
+            const s = JSON.parse(require("fs").readFileSync(f, "utf8")).filter((x) => x?.context === "opendesk/check")[0];
+            const ok = s && s.state === "success" && s.creator?.login === "github-actions[bot]" && s.description === "ACCEPTED " + gap;
+            if (!ok) { console.log("NOT CREDITED: the newest opendesk/check status on the head is not ACCEPTED " + gap + " by verdict.yml"); process.exit(1); }' \
+            "$d/statuses.json" "$gap" || { echo "credit=no" >> "$GITHUB_OUTPUT"; exit 1; }
+          echo "credit=yes" >> "$GITHUB_OUTPUT"
+
+      - name: Tell the desk (accepted)
+        if: steps.ok.outputs.credit == 'yes'
+        env:
+          TOKEN: ${{ secrets.OPENDESK_ADMIN_TOKEN }}
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/in"
+          [ -n "${TOKEN:-}" ] || { echo "FAULT: the repository secret OPENDESK_ADMIN_TOKEN is not set (docs/maintainers.md)"; exit 1; }
+          node -e '
+            const fs = require("fs"); const d = process.argv[1];
+            const r = (n) => fs.readFileSync(d + "/" + n, "utf8").trim();
+            const body = { gap: r("gap.id"), handle: r("pr.author"), pr: r("pr.url") };
+            if (r("gap.board")) body.board = r("gap.board");
+            fs.writeFileSync(d + "/accepted.json", JSON.stringify(body));' "$d"
+          # The token goes in a header file, never on the command line.
+          umask 077
+          printf 'Authorization: Bearer %s\n' "$TOKEN" > "$RUNNER_TEMP/auth"
+          code=$(curl -sS --proto '=https' --max-redirs 0 --max-time 30 --retry 3 --retry-all-errors \
+            -H @"$RUNNER_TEMP/auth" -H 'Content-Type: application/json' --data-binary @"$d/accepted.json" \
+            -o "$d/answer.json" -w '%{http_code}' "$DESK_URL/accepted") || code=000
+          rm -f "$RUNNER_TEMP/auth"
+          ok=$(node -e 'try { const a = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); process.stdout.write(a?.ok === true ? (a.already ? "already" : "yes") : "no"); } catch { process.stdout.write("no"); }' "$d/answer.json" 2>/dev/null || echo no)
+          if [ "$code" = 200 ] && [ "$ok" != no ]; then
+            echo "CREDITED: $(cat "$d/gap.id") to $(cat "$d/pr.author")${ok#yes}" | tee -a "$GITHUB_STEP_SUMMARY"
+          elif [ "$code" = 409 ] && grep -q '"other_pr"' "$d/answer.json" 2>/dev/null; then
+            # A decision, not an outage: the desk reserved this gap for a different pull request.
+            # Re-running gives the same answer; a maintainer decides (docs/maintainers.md, force).
+            echo "NOT CREDITED: the desk reserved $(cat "$d/gap.id") for another pull request; a maintainer decides (docs/maintainers.md)" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          else
+            echo "FAULT: the desk answered $code; re-run this job once the desk is up (docs/maintainers.md)" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Hand the gap back (closed without a merge, and the desk's review names this pull request)
+        if: steps.pr.outputs.tell == 'yes' && env.MERGED == 'false'
+        env:
+          TOKEN: ${{ secrets.OPENDESK_ADMIN_TOKEN }}
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/in"
+          gap=$(cat "$d/gap.id"); board=$(cat "$d/gap.board")
+          q="gap=${gap}"; [ -z "$board" ] || q="${q}&board=${board}"
+          # The desk not answering is a FAULT (re-run this job), not "nothing to hand back": the gap
+          # would otherwise stay in review for 72 hours.
+          curl -sSf --proto '=https' --max-redirs 0 --max-time 30 --retry 3 --retry-all-errors --max-filesize 1000000 -o "$d/step.json" "$DESK_URL/step?${q}" || { echo "FAULT: the desk could not be read; re-run this job once the desk is up (docs/maintainers.md)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
+          mine=$(node -e '
+            const [f, url, n] = process.argv.slice(1);
+            const s = JSON.parse(require("fs").readFileSync(f, "utf8"));
+            const pr = String(s?.review?.pr ?? "");
+            process.stdout.write(s?.state === "review" && (pr === url || pr === n) ? "yes" : "no");' "$d/step.json" "$(cat "$d/pr.url")" "$PR")
+          [ "$mine" = yes ] || { echo "the desk's review of $gap does not name this pull request; nothing handed back"; exit 0; }
+          [ -n "${TOKEN:-}" ] || { echo "FAULT: the repository secret OPENDESK_ADMIN_TOKEN is not set (docs/maintainers.md)"; exit 1; }
+          node -e '
+            const fs = require("fs"); const [d] = process.argv.slice(1);
+            const r = (n) => fs.readFileSync(d + "/" + n, "utf8").trim();
+            const body = { gap: r("gap.id"), pr: r("pr.url"), reason: "pull_request_closed" };
+            if (r("gap.board")) body.board = r("gap.board");
+            fs.writeFileSync(d + "/rejected.json", JSON.stringify(body));' "$d"
+          umask 077
+          printf 'Authorization: Bearer %s\n' "$TOKEN" > "$RUNNER_TEMP/auth"
+          code=$(curl -sS --proto '=https' --max-redirs 0 --max-time 30 --retry 3 --retry-all-errors \
+            -H @"$RUNNER_TEMP/auth" -H 'Content-Type: application/json' --data-binary @"$d/rejected.json" \
+            -o "$d/answer.json" -w '%{http_code}' "$DESK_URL/rejected") || code=000
+          rm -f "$RUNNER_TEMP/auth"
+          ok=$(node -e 'try { const a = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); process.stdout.write(a?.ok === true ? "yes" : "no"); } catch { process.stdout.write("no"); }' "$d/answer.json" 2>/dev/null || echo no)
+          [ "$code" = 200 ] && [ "$ok" = yes ] || { echo "FAULT: the desk answered $code; re-run this job once the desk is up (docs/maintainers.md)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
+          echo "HANDED BACK: $gap" | tee -a "$GITHUB_STEP_SUMMARY"

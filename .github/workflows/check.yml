@@ -1,0 +1,209 @@
+# THE CHECK of a pull request, part 1 of 2: judge the one file, write the verdict as an artifact.
+# Part 2 is verdict.yml (workflow_run, base code only), which reads the artifact, binds it to the
+# pull request's current head and posts the verdict: the commit status `opendesk/check`, a comment
+# and a label. Branch protection requires `opendesk/check` (docs/maintainers.md).
+#
+# This job runs on pull_request: no secrets, a read-only token, and the WORKFLOW FILE IS THE
+# PULL REQUEST'S OWN (the merge commit's copy). That is why it may hold nothing of value and why
+# nothing it writes is believed by itself. It is trusted only for a pull request that changes
+# exactly one file at an allowed path, which verdict.yml checks again with the base branch's
+# guard; such a pull request cannot have changed this file. Everything that judges is taken
+# from the BASE commit: the guard, the checker, the verifier, the lakefile, the manifest and the
+# toolchain. The only thing taken from the pull request is the bytes of its one file, fetched
+# through the API by blob hash, never a checkout of its tree.
+#
+# A Lean file runs code while it compiles. The plain-file rule (outside-guard.mjs) refuses every
+# known way to do that, but it is a filter, not a sandbox. Here the compile runs as this job's
+# account, so a file that slips past the filter could forge this job's artifact. What it cannot
+# do: read a secret (there is none), write to the repository (the token is read-only), or set the
+# commit status (only verdict.yml can). A maintainer still reviews and merges by hand. See
+# docs/maintainers.md, "What the check does not promise".
+#
+# Adapted from open-goat/pequalnp-proofs (Apache-2.0), .github/workflows/advisory.yml and
+# authoritative.yml. This replaces the template's advisory.yml.
+name: check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # Values from the event go through env and a strict pattern, never into a script as text.
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      GH_TOKEN: ${{ github.token }}
+      # The desk's public list of gaps (GET /desk/gaps.json). Override with the repository
+      # variable OPENDESK_GAPS_URL.
+      GAPS_URL: ${{ vars.OPENDESK_GAPS_URL || 'https://www.1proof.site/desk/gaps.json' }}
+      # THE PINNED ELAN (as in pequalnp-proofs). To bump: change both values together, here and in
+      # lean-cache.yml.
+      ELAN_VERSION: v4.4.0
+      ELAN_SHA256: 0e8250aa2be86c7af929ade68db617af9edc8b9ccf6eaf5ece228250d0d032e2
+    steps:
+      - name: Fetch the BASE commit only (plain git, no stored credentials)
+        run: |
+          set -eu
+          case "$PR" in ''|*[!0-9]*) echo "REFUSED: bad pull request number"; exit 1 ;; esac
+          printf '%s' "$BASE_SHA" | grep -Eqx '[0-9a-f]{40}' || { echo "REFUSED: bad base commit"; exit 1; }
+          printf '%s' "$HEAD_SHA" | grep -Eqx '[0-9a-f]{40}' || { echo "REFUSED: bad head commit"; exit 1; }
+          git init -q base
+          git -C base fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "$BASE_SHA"
+          git -C base checkout -q --detach FETCH_HEAD
+          # The scripts that judge, copied out of the tree before anything else happens in it.
+          mkdir -p "$RUNNER_TEMP/scripts" "$RUNNER_TEMP/in"
+          for f in outside-guard.mjs verdict.mjs install-elan.sh; do
+            git -C base show "HEAD:.github/scripts/$f" > "$RUNNER_TEMP/scripts/$f"
+          done
+
+      - name: The pull request, read through the API, and its one file as data
+        id: pr
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/in"
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}" > "$d/pr.json"
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files?per_page=3" > "$d/files.json"
+          gh api "repos/${GITHUB_REPOSITORY}/git/trees/${HEAD_SHA}?recursive=1" > "$d/tree.json"
+          set +e
+          node "$RUNNER_TEMP/scripts/outside-guard.mjs" pr "$d/pr.json" "$d/files.json" "$d/tree.json" "$GITHUB_REPOSITORY" "$DEFAULT_BRANCH" "$d" > "$d/guard.out"
+          code=$?
+          set -e
+          cat "$d/guard.out"
+          if [ "$code" -ne 0 ]; then echo refused > "$d/stage"; exit 1; fi
+          [ "$(cat "$d/pr.head")" = "$HEAD_SHA" ] || { echo "the pull request moved on since this run started; the newer run judges it"; exit 1; }
+          blob=$(cat "$d/pr.blob")
+          gh api -H "Accept: application/vnd.github.raw" "repos/${GITHUB_REPOSITORY}/git/blobs/${blob}" > "$d/proof.lean"
+          [ "$(git hash-object "$d/proof.lean")" = "$blob" ] || { echo "FAULT: the fetched bytes are not the file's blob"; exit 1; }
+          echo "file: $(cat "$d/pr.file")"
+
+      - name: The posted gap and the file rules
+        id: guard
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/in"
+          curl -sSf --proto '=https' --max-redirs 0 --max-filesize 20000000 -o "$d/gaps.json" "$GAPS_URL"
+          set +e
+          node "$RUNNER_TEMP/scripts/outside-guard.mjs" gap-of-file "$d/gaps.json" "$(cat "$d/pr.file")" "$d" > "$d/guard.out"
+          code=$?
+          if [ "$code" -eq 0 ]; then
+            # The guard's lines quote only sanitized pieces of the file, but are printed with
+            # workflow commands switched off all the same.
+            stop="stop-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+            echo "::stop-commands::$stop"
+            node "$RUNNER_TEMP/scripts/outside-guard.mjs" imports "$d/proof.lean" "$d/imports.json" "$(cat "$d/pr.file")" > "$d/guard.out"
+            code=$?
+            cat "$d/guard.out"
+            echo "::$stop::"
+          else
+            cat "$d/guard.out"
+          fi
+          set -e
+          if [ "$code" -ne 0 ]; then echo refused > "$d/stage"; exit 1; fi
+          kind=$(cat "$d/gap.kind")
+          echo "gap: $(cat "$d/gap.id")  kind: $kind"
+          case "$kind" in
+            check|refute) echo "judge=yes" >> "$GITHUB_OUTPUT" ;;
+            # A statement or a witness is not compiled here: a person reviews it.
+            *) echo review > "$d/stage"; echo "judge=no" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Install the pinned Lean toolchain
+        if: steps.guard.outputs.judge == 'yes'
+        run: |
+          set -eu
+          sh "$RUNNER_TEMP/scripts/install-elan.sh" "$ELAN_VERSION" "$ELAN_SHA256" "$HOME/.elan" "$(cat base/lean/lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      # RESTORE ONLY. The cache is written by lean-cache.yml on the default branch, from base code,
+      # never by a pull request run: a run that compiled an outside file must not be able to hand
+      # its .lake to the next one.
+      - name: Restore the Lean packages (Mathlib and formal-conjectures) from the default branch's cache
+        if: steps.guard.outputs.judge == 'yes'
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: base/lean/.lake/packages
+          key: lean-packages-${{ hashFiles('base/lean/lake-manifest.json', 'base/lean/lean-toolchain', 'base/lean/lakefile.toml') }}
+
+      - name: Fetch the prebuilt Mathlib
+        if: steps.guard.outputs.judge == 'yes'
+        working-directory: base/lean
+        run: lake exe cache get
+
+      - name: Swap space for the verifier
+        if: steps.guard.outputs.judge == 'yes'
+        run: |
+          set -eu
+          # The verifier imports all of Mathlib twice (the statement environment and the proof's);
+          # without swap a standard runner can run out of memory.
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL
+          d=$(df -m --output=avail,target / /mnt 2>/dev/null | awk 'NR>1' | sort -rn | awk 'NR==1{print $2}')
+          mb=$(( $(df -m --output=avail "$d" | awk 'NR==2{print $1}') - 6144 ))
+          [ "$mb" -le 12288 ] || mb=12288
+          if [ "$mb" -ge 1024 ]; then
+            f="${d%/}/desk-swap"
+            sudo fallocate -l "${mb}M" "$f" && sudo chmod 600 "$f"
+            sudo mkswap -q "$f" && sudo swapon "$f"
+          fi
+          free -m
+
+      - name: Run the BASE checker on the one file
+        if: steps.guard.outputs.judge == 'yes'
+        timeout-minutes: 60
+        run: |
+          set -u
+          in="$RUNNER_TEMP/in"
+          file=$(cat "$in/pr.file")
+          # The base tree plus the one file, nothing else of the pull request.
+          [ ! -e "base/$file" ] || { echo "FAULT: $file already exists on the base branch"; exit 1; }
+          mkdir -p "base/$(dirname "$file")"
+          cp "$in/proof.lean" "base/$file"
+          echo judged > "$in/stage.next"
+          # The gap's values passed the guard's strict patterns (gap-of-file).
+          node base/tools/check-lean.mjs "base/$file" "$(cat "$in/gap.constant")" "$(cat "$in/gap.module")" "$(cat "$in/gap.kind")" > "$RUNNER_TEMP/out" 2> "$RUNNER_TEMP/err"
+          code=$?
+          pkill -KILL -f "lean/.lake/build/bin/checklemma" || true
+          cp "$RUNNER_TEMP/out" "$in/out"; echo "$code" > "$in/code"; mv "$in/stage.next" "$in/stage"
+          # The output can quote the proof file, so it is printed with workflow commands switched off.
+          stop="stop-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          echo "::stop-commands::$stop"
+          tail -n 40 "$RUNNER_TEMP/err"
+          tail -n 60 "$RUNNER_TEMP/out"
+          echo "::$stop::"
+          case "$code" in
+            0) echo "CHECKER: ACCEPTED" ;;
+            1) echo "CHECKER: REJECTED (the last line above says why)" ;;
+            *) echo "CHECKER: could not judge (exit $code)" ;;
+          esac
+          exit "$code"
+
+      - name: Write the verdict
+        if: always()
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/verdict"
+          node "$RUNNER_TEMP/scripts/verdict.mjs" make "$RUNNER_TEMP/in" "$PR" "$HEAD_SHA" "$RUNNER_TEMP/verdict/verdict.txt"
+          cat "$RUNNER_TEMP/verdict/verdict.txt" | sed -n 's/^verdict /VERDICT: /p'
+
+      - name: Hand the verdict to verdict.yml
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          # One artifact per attempt: a re-run (same run id, next attempt) uploads its own, and
+          # verdict.yml reads the one named after the attempt it was started for.
+          name: opendesk-verdict-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/verdict/verdict.txt
+          if-no-files-found: error
+          retention-days: 7

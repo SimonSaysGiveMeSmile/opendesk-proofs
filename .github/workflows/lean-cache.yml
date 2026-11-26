@@ -1,0 +1,73 @@
+# THE LEAN CACHE: the packages of the pinned environment (Mathlib with its prebuilt files, and
+# formal-conjectures), saved from the default branch for check.yml to restore.
+#
+# Only this workflow writes the cache, and it runs only base code on the default branch: it fetches
+# the packages and Mathlib's prebuilt files and builds nothing of the repository, so no outside
+# file is compiled here. check.yml only restores (a pull request run must never be able to hand
+# its .lake to the next run). A cache unused for 7 days is evicted by GitHub; the weekly run keeps
+# it warm.
+name: lean-cache
+
+on:
+  push:
+    branches: [main]
+    paths: [lean/lake-manifest.json, lean/lean-toolchain, lean/lakefile.toml]
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lean-cache
+  cancel-in-progress: false
+
+jobs:
+  cache:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      # Kept equal to check.yml.
+      ELAN_VERSION: v4.4.0
+      ELAN_SHA256: 0e8250aa2be86c7af929ade68db617af9edc8b9ccf6eaf5ece228250d0d032e2
+    steps:
+      - name: Refuse a run from another branch
+        run: |
+          set -eu
+          [ "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH" ] || { echo "REFUSED: run this from $DEFAULT_BRANCH"; exit 1; }
+
+      - name: Fetch the default branch (plain git, no stored credentials)
+        run: |
+          set -eu
+          git init -q base
+          git -C base fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          git -C base checkout -q --detach FETCH_HEAD
+
+      - name: Look for the cache of this environment
+        id: have
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: base/lean/.lake/packages
+          key: lean-packages-${{ hashFiles('base/lean/lake-manifest.json', 'base/lean/lean-toolchain', 'base/lean/lakefile.toml') }}
+          lookup-only: true
+
+      - name: Install the pinned Lean toolchain
+        if: steps.have.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          sh base/.github/scripts/install-elan.sh "$ELAN_VERSION" "$ELAN_SHA256" "$HOME/.elan" "$(cat base/lean/lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch the packages and the prebuilt Mathlib
+        if: steps.have.outputs.cache-hit != 'true'
+        working-directory: base/lean
+        run: lake exe cache get
+
+      - name: Save the cache
+        if: steps.have.outputs.cache-hit != 'true'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: base/lean/.lake/packages
+          key: lean-packages-${{ hashFiles('base/lean/lake-manifest.json', 'base/lean/lean-toolchain', 'base/lean/lakefile.toml') }}

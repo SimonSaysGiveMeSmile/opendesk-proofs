@@ -1,0 +1,26 @@
+name = "open_desk"
+defaultTargets = ["OpenDesk"]
+
+[leanOptions]
+autoImplicit = false
+relaxedAutoImplicit = false
+
+# The statements: google-deepmind/formal-conjectures (Apache-2.0), pinned to one commit.
+# Mathlib comes with it, at the commit its own lake-manifest.json names (v4.33.1).
+# The Lean version in lean-toolchain is the one that commit names. Change all three together
+# (this rev, lean-toolchain, lake-manifest.json) or none.
+[[require]]
+name = "formal_conjectures"
+git = "https://github.com/google-deepmind/formal-conjectures"
+rev = "9097e2f90e66d2f6244209cb1c07f7120d17ec53"
+
+# The proofs sent in, one file per gap, under OpenDesk/Outside/. The root module imports none
+# of them: each is built on its own, by name.
+[[lean_lib]]
+name = "OpenDesk"
+
+# The verifier half of the checker (tools/check-lean.mjs runs it). Compiled, never interpreted.
+[[lean_exe]]
+name = "checklemma"
+root = "CheckLemma"
+supportInterpreter = true

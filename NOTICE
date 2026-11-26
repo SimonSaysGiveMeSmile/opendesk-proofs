@@ -1,0 +1,15 @@
+Erdős problems desk: proofs repository
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository reuses, with changes, code and design from open-goat/pequalnp-proofs
+(https://github.com/open-goat/pequalnp-proofs), Apache License 2.0: the checker
+(tools/check-lean.mjs, lean/CheckLemma.lean), the pull-request guard
+(.github/scripts/outside-guard.mjs), the pinned elan installer (.github/scripts/install-elan.sh,
+unchanged), the check workflows, the agent client (tools/desk.sh, from tools/pnp.sh) and the
+contribution rules.
+
+The statements judged here are those of google-deepmind/formal-conjectures
+(https://github.com/google-deepmind/formal-conjectures), Copyright 2025 The Formal Conjectures
+Authors, Apache License 2.0. It is a dependency pinned to one commit in lean/lakefile.toml; no
+file of it is copied into this repository. The statement skeletons that tools/desk.sh writes are
+copied from its pinned source.

@@ -1,0 +1,86 @@
+# THE GUARD of a pull request: exactly one added file, at lean/OpenDesk/Outside/<gap id>.lean (a
+# proof), statements/<gap id>.lean or witnesses/<gap id>.json (reviewed by a person), a
+# plain file of at most 512 KiB, a gap the desk posts, and the import, plain-file and own-namespace
+# rules (CONTRIBUTING.md). Nothing is built and nothing of the pull request runs. It answers in
+# seconds; the verdict that counts is check.yml + verdict.yml (the status opendesk/check).
+#
+# It runs on pull_request_target, so the workflow and the guard script are the BASE branch's, never
+# the pull request's. The pull request's file is read through the API as data (its blob, by hash)
+# and handed to the base's guard. No step checks out, builds or runs anything from the pull request.
+#
+# Adapted from open-goat/pequalnp-proofs (Apache-2.0).
+name: outside-guard
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: outside-guard-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # Values from the event go through env and a strict pattern, never into a script as text.
+      PR: ${{ github.event.pull_request.number }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      GH_TOKEN: ${{ github.token }}
+      # The desk's public list of gaps (GET /desk/gaps.json). Override with the repository variable
+      # OPENDESK_GAPS_URL. If it cannot be read the guard fails closed.
+      GAPS_URL: ${{ vars.OPENDESK_GAPS_URL || 'https://www.1proof.site/desk/gaps.json' }}
+    steps:
+      - name: Fetch the base branch (plain git, no stored credentials)
+        run: |
+          set -eu
+          case "$PR" in ''|*[!0-9]*) echo "REFUSED: bad pull request number"; exit 1 ;; esac
+          printf '%s' "$BASE_SHA" | grep -Eqx '[0-9a-f]{40}' || { echo "REFUSED: bad base commit"; exit 1; }
+          git init -q base
+          git -C base fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "$BASE_SHA"
+          git -C base checkout -q --detach FETCH_HEAD
+
+      - name: The pull request, read through the API
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/in"; mkdir -p "$d"
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}" > "$d/pr.json"
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files?per_page=3" > "$d/files.json"
+          head=$(node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); process.stdout.write(String(p?.head?.sha??""))' "$d/pr.json")
+          printf '%s' "$head" | grep -Eqx '[0-9a-f]{40}' || { echo "REFUSED: the pull request has no head commit"; exit 1; }
+          gh api "repos/${GITHUB_REPOSITORY}/git/trees/${head}?recursive=1" > "$d/tree.json"
+          node base/.github/scripts/outside-guard.mjs pr "$d/pr.json" "$d/files.json" "$d/tree.json" "$GITHUB_REPOSITORY" "$DEFAULT_BRANCH" "$d"
+          echo "file: $(cat "$d/pr.file")"
+
+      - name: The file's bytes, as data
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/in"
+          blob=$(cat "$d/pr.blob")
+          printf '%s' "$blob" | grep -Eqx '[0-9a-f]{40}' || { echo "REFUSED: bad blob"; exit 1; }
+          gh api -H "Accept: application/vnd.github.raw" "repos/${GITHUB_REPOSITORY}/git/blobs/${blob}" > "$d/proof.lean"
+          # The bytes must be the blob the tree names (git's own hash of them).
+          [ "$(git hash-object "$d/proof.lean")" = "$blob" ] || { echo "REFUSED: the fetched bytes are not the file's blob"; exit 1; }
+
+      - name: The posted gap and the file rules
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/in"
+          curl -sSf --proto '=https' --max-redirs 0 --max-filesize 20000000 -o "$d/gaps.json" "$GAPS_URL"
+          node base/.github/scripts/outside-guard.mjs gap-of-file "$d/gaps.json" "$(cat "$d/pr.file")" "$d"
+          echo "gap: $(cat "$d/gap.id")  constant: $(cat "$d/gap.constant")  kind: $(cat "$d/gap.kind")"
+          # The guard's lines quote only sanitized pieces of the file, but are printed with workflow
+          # commands switched off all the same.
+          stop="stop-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          echo "::stop-commands::$stop"
+          set +e
+          node base/.github/scripts/outside-guard.mjs imports "$d/proof.lean" "$d/imports.json" "$(cat "$d/pr.file")"
+          code=$?
+          echo "::$stop::"
+          exit "$code"

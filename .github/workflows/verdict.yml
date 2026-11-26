@@ -1,0 +1,209 @@
+# THE CHECK of a pull request, part 2 of 2: post the verdict that counts.
+#
+# Runs on workflow_run after check.yml, from the DEFAULT BRANCH's copy of this file, with a token
+# that may comment, label and set commit statuses. It never checks out, builds or runs anything
+# from the pull request. It reads the check run's artifact as data and believes only the verdict
+# word and its reason, and only after it has found, by itself and with the base branch's guard:
+#   - that the run was check.yml (by path), on a pull_request, in this repository;
+#   - the pull request the artifact names, whose CURRENT head is the run's head (a newer push
+#     supersedes the verdict, and the newer run posts its own);
+#   - that the pull request adds exactly one plain file at an allowed path and changes nothing else
+#     (so the check.yml that ran was the base branch's, unchanged), that its gap is on the desk,
+#     and that the file passes the file rules again;
+#   - for ACCEPTED, that the accepted bytes are the bytes of the pull request's file (sha256).
+# Then it sets the commit status `opendesk/check` on the head, labels the pull request and posts
+# (or updates) one comment.
+#
+# Adapted from open-goat/pequalnp-proofs (Apache-2.0): its rule that the verdict which counts comes
+# only from base-branch code (authoritative.yml), here split over pull_request + workflow_run.
+name: verdict
+
+on:
+  workflow_run:
+    workflows: [check]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+  issues: write
+  statuses: write
+
+concurrency:
+  group: verdict-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  verdict:
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      # A re-run keeps the run id and counts up the attempt; each attempt uploads its own artifact,
+      # opendesk-verdict-<attempt> (check.yml), and this job reads the one of the attempt it is for.
+      RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
+      RUN_PATH: ${{ github.event.workflow_run.path }}
+      RUN_REPO: ${{ github.event.workflow_run.repository.full_name }}
+      RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      GH_TOKEN: ${{ github.token }}
+      GAPS_URL: ${{ vars.OPENDESK_GAPS_URL || 'https://www.1proof.site/desk/gaps.json' }}
+    steps:
+      - name: Refuse a run that is not check.yml on a pull request of this repository
+        run: |
+          set -eu
+          [ "$RUN_PATH" = ".github/workflows/check.yml" ] || { echo "REFUSED: the run is not check.yml"; exit 1; }
+          [ "$RUN_REPO" = "$GITHUB_REPOSITORY" ] || { echo "REFUSED: the run is not of this repository"; exit 1; }
+          printf '%s' "$RUN_ID" | grep -Eqx '[0-9]{1,20}' || { echo "REFUSED: bad run id"; exit 1; }
+          printf '%s' "$RUN_ATTEMPT" | grep -Eqx '[1-9][0-9]{0,3}' || { echo "REFUSED: bad run attempt"; exit 1; }
+          printf '%s' "$RUN_HEAD" | grep -Eqx '[0-9a-f]{40}' || { echo "REFUSED: bad head commit"; exit 1; }
+
+      - name: Take OUR scripts from the default branch (plain git, no stored credentials)
+        run: |
+          set -eu
+          git init -q "$RUNNER_TEMP/base"
+          git -C "$RUNNER_TEMP/base" fetch -q --depth 1 --filter=blob:none "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          mkdir -p "$RUNNER_TEMP/scripts" "$RUNNER_TEMP/t" "$RUNNER_TEMP/v" "$RUNNER_TEMP/out"
+          for f in outside-guard.mjs verdict.mjs; do
+            git -C "$RUNNER_TEMP/base" show "$GITHUB_SHA:.github/scripts/$f" > "$RUNNER_TEMP/scripts/$f"
+          done
+
+      - name: The artifact, as data (one file, at most 4 KiB)
+        id: art
+        run: |
+          set -eu
+          v="$RUNNER_TEMP/v"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" > "$v/list.json"
+          # Exactly one artifact named opendesk-verdict-<this attempt>, small, not expired. (The list
+          # holds the artifacts of every attempt of the run; an earlier attempt's is not this one.)
+          id=$(node -e '
+            const l = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).artifacts ?? [];
+            const a = l.filter((x) => x?.name === "opendesk-verdict-" + process.argv[2]);
+            const ok = a.length === 1 && !a[0].expired && Number.isInteger(a[0].id) && a[0].size_in_bytes > 0 && a[0].size_in_bytes <= 65536;
+            process.stdout.write(ok ? String(a[0].id) : "");' "$v/list.json" "$RUN_ATTEMPT")
+          if [ -z "$id" ]; then
+            echo "no verdict artifact for attempt $RUN_ATTEMPT (run conclusion: $RUN_CONCLUSION); nothing to post"
+            echo "have=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}/zip" > "$v/a.zip"
+          [ "$(wc -c < "$v/a.zip")" -le 65536 ] || { echo "REFUSED: the artifact is too large"; exit 1; }
+          # One member, named verdict.txt, at most 4 KiB once unpacked. Read by python in isolated
+          # mode, member by member: nothing is extracted to a path the archive names.
+          python3 -I - "$v/a.zip" "$v/verdict.txt" <<'PY'
+          import sys, zipfile
+          z = zipfile.ZipFile(sys.argv[1])
+          m = z.infolist()
+          if len(m) != 1 or m[0].filename != "verdict.txt" or m[0].file_size > 4096 or m[0].is_dir():
+              print("REFUSED: the artifact is not one small verdict.txt"); sys.exit(1)
+          data = z.open(m[0]).read(4097)
+          if len(data) > 4096:
+              print("REFUSED: the artifact is not one small verdict.txt"); sys.exit(1)
+          open(sys.argv[2], "wb").write(data)
+          PY
+          pr=$(node "$RUNNER_TEMP/scripts/verdict.mjs" pr-of "$v/verdict.txt" | sed -n 1p)
+          printf '%s' "$pr" | grep -Eqx '[1-9][0-9]{0,8}' || { echo "REFUSED: the artifact names no pull request"; exit 1; }
+          echo "PR=$pr" >> "$GITHUB_ENV"
+          echo "have=yes" >> "$GITHUB_OUTPUT"
+
+      - name: The pull request, read through the API, and the base branch's guard
+        id: guard
+        if: steps.art.outputs.have == 'yes'
+        run: |
+          set -eu
+          t="$RUNNER_TEMP/t"
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}" > "$t/pr.json"
+          head=$(node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); process.stdout.write(String(p?.head?.sha??""))' "$t/pr.json")
+          if [ "$head" != "$RUN_HEAD" ]; then
+            echo "the pull request's head is no longer the run's head; the run of the newer head posts its own verdict"
+            echo "post=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "post=yes" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$PR" > "$t/pr.number"
+          g="$RUNNER_TEMP/scripts/outside-guard.mjs"
+          # Only the guard's own refusal (exit 1 with REFUSED lines) is REFUSED. Anything the job
+          # could not read (the API, the desk's gap list, the file's bytes) is a FAULT: it says
+          # `FAULT: ...` and exits 2, and the verdict tells the author the maintainers re-run it.
+          set +e
+          (
+            set -e
+            fault() { echo "FAULT: $1"; exit 2; }
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files?per_page=3" > "$t/files.json" || fault "the pull request's file list could not be read"
+            gh api "repos/${GITHUB_REPOSITORY}/git/trees/${RUN_HEAD}?recursive=1" > "$t/tree.json" || fault "the tree of the head commit could not be read"
+            node "$g" pr "$t/pr.json" "$t/files.json" "$t/tree.json" "$GITHUB_REPOSITORY" "$DEFAULT_BRANCH" "$t" || exit 1
+            blob=$(cat "$t/pr.blob")
+            gh api -H "Accept: application/vnd.github.raw" "repos/${GITHUB_REPOSITORY}/git/blobs/${blob}" > "$t/proof" || fault "the file's bytes could not be fetched"
+            [ "$(git hash-object "$t/proof")" = "$blob" ] || fault "the fetched bytes are not the file's blob (a short read)"
+            sha256sum "$t/proof" | cut -c1-64 > "$t/proof.sha256"
+            curl -sSf --proto '=https' --max-redirs 0 --max-time 60 --retry 3 --retry-all-errors --max-filesize 20000000 -o "$t/gaps.json" "$GAPS_URL" || fault "the desk's gap list could not be read"
+            node "$g" gap-of-file "$t/gaps.json" "$(cat "$t/pr.file")" "$t" || exit 1
+            node "$g" imports "$t/proof" "$t/imports.json" "$(cat "$t/pr.file")" || exit 1
+          ) > "$t/guard.out" 2>&1
+          code=$?
+          set -e
+          # Printed with workflow commands switched off: the guard quotes sanitized pieces of the file.
+          stop="stop-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          echo "::stop-commands::$stop"
+          cat "$t/guard.out"
+          echo "::$stop::"
+          if [ "$code" -eq 0 ]; then holds=yes
+          elif [ "$code" -eq 1 ] && grep -q '^REFUSED: ' "$t/guard.out"; then holds=no
+          else holds=fault; fi
+          echo "holds=$holds" >> "$GITHUB_OUTPUT"
+
+      - name: The verdict
+        id: v
+        if: steps.guard.outputs.post == 'yes'
+        env:
+          HOLDS: ${{ steps.guard.outputs.holds }}
+        run: |
+          set -eu
+          t="$RUNNER_TEMP/t"; o="$RUNNER_TEMP/out"
+          vm="$RUNNER_TEMP/scripts/verdict.mjs"
+          printf '%s\n' "$RUN_HEAD" > "$t/pr.head"
+          case "$HOLDS" in
+            yes)
+              if ! node "$vm" read "$RUNNER_TEMP/v/verdict.txt" "$t" "$o"; then
+                # A malformed or unbound artifact is never believed: the verdict is a FAULT.
+                printf 'FAULT: the check run gave no verdict bound to this head\n' > "$t/bind.out"
+                node "$vm" fault "$t/bind.out" "$t" "$o"
+              fi ;;
+            no) node "$vm" refused "$t/guard.out" "$t" "$o" ;;
+            # The job could not finish its own checks: an outage, never the file's fault.
+            *) node "$vm" fault "$t/guard.out" "$t" "$o" ;;
+          esac
+          verdict=$(cat "$o/verdict")
+          case "$verdict" in ACCEPTED|REJECTED|REFUSED|FAULT|REVIEW) ;; *) echo "FAULT: bad verdict word"; exit 1 ;; esac
+          echo "VERDICT: $verdict" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Post the status, the label and the comment
+        if: steps.guard.outputs.post == 'yes'
+        run: |
+          set -eu
+          o="$RUNNER_TEMP/out"
+          R="repos/${GITHUB_REPOSITORY}"
+          # The status links to the check run whose verdict it carries.
+          node -e '
+            const fs = require("fs"); const [f, url] = process.argv.slice(1);
+            fs.writeFileSync(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, "utf8")), target_url: url }));' \
+            "$o/status.json" "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}"
+          gh api -X POST "$R/statuses/${RUN_HEAD}" --input "$o/status.json" > /dev/null
+          label=$(cat "$o/label")
+          case "$label" in opendesk:accepted|opendesk:rejected|opendesk:fault|opendesk:review) ;; *) echo "FAULT: bad label"; exit 1 ;; esac
+          for l in opendesk:accepted opendesk:rejected opendesk:fault opendesk:review; do
+            [ "$l" = "$label" ] || gh api -X DELETE "$R/issues/${PR}/labels/$l" > /dev/null 2>&1 || true
+          done
+          printf '{"labels":["%s"]}' "$label" > "$o/labels.json"
+          gh api -X POST "$R/issues/${PR}/labels" --input "$o/labels.json" > /dev/null
+          # One comment per pull request, updated in place: the one this workflow posted before.
+          cid=$(gh api --paginate "$R/issues/${PR}/comments?per_page=100" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- opendesk-verdict -->"))) | .id' | tail -n 1)
+          printf '%s' "$cid" | grep -Eqx '[0-9]{0,20}' || { echo "FAULT: bad comment id"; exit 1; }
+          if [ -n "$cid" ]; then
+            gh api -X PATCH "$R/issues/comments/${cid}" --input "$o/comment.json" > /dev/null
+          else
+            gh api -X POST "$R/issues/${PR}/comments" --input "$o/comment.json" > /dev/null
+          fi
+          echo "posted: $(cat "$o/verdict") on #${PR} at ${RUN_HEAD}"
