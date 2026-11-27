@@ -3,6 +3,11 @@
 // file could carry code that runs while it compiles, and the honest shapes that must pass.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { checkFile, checkGap, checkImports, checkOwnNamespace, checkPr, checkProofFile, isConstant, MAX_NAME, quoteName, Refused } from './outside-guard.mjs';
 
 const MOD = 'FormalConjectures.ErdosProblems.«1»';
@@ -248,3 +253,24 @@ test('refused in merged mode: a checked row whose id, file or kind disagree', ()
 refused('_root_ as a name part', `theorem ${M} : True := _root_.trivial\n`, '_root_');
 refused('_root_ after a dot', `theorem ${M} : True := X._root_.trivial\n`, '_root_');
 passes('a name that only contains the letters _root_ (cube_root_linearithmic)', `namespace ${M}\ntheorem cube_root_le : True := trivial\nend ${M}\n\ntheorem ${M} : True := ${M}.cube_root_le\n`);
+
+// Run as a script from a folder whose name holds '#' and '%', and through a symlink: main() still runs
+// and prints its verdict line. (Compared as URLs, such a path skipped main() and exited 0 silently.)
+test('main runs from a path with # and %, and through a symlink', () => {
+  const base = mkdtempSync(join(tmpdir(), 'guard-'));
+  try {
+    const odd = join(base, 'a#b%c'); mkdirSync(odd);
+    const script = join(odd, 'outside-guard.mjs');
+    copyFileSync(fileURLToPath(new URL('./outside-guard.mjs', import.meta.url)), script);
+    symlinkSync(script, join(base, 'link.mjs'));
+    writeFileSync(join(base, 'proof.lean'), head + thm); writeFileSync(join(base, 'imports.json'), JSON.stringify([MOD]));
+    for (const s of [script, join(base, 'link.mjs')]) {
+      const ok = spawnSync(process.execPath, [s, 'imports', join(base, 'proof.lean'), join(base, 'imports.json'), 'lean/OpenDesk/Outside/erdos_1.lean'], { encoding: 'utf8' });
+      assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+      assert.match(ok.stdout, /^GUARD OK: imports$/m);
+      const bad = spawnSync(process.execPath, [s, 'imports', join(base, 'proof.lean'), join(base, 'imports.json'), 'elsewhere.lean'], { encoding: 'utf8' });
+      assert.equal(bad.status, 1, bad.stdout + bad.stderr);
+      assert.match(bad.stdout, /^REFUSED: the one file must be/m);
+    }
+  } finally { rmSync(base, { recursive: true, force: true }); }
+});

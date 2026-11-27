@@ -34,8 +34,9 @@
 // Adapted in spirit from open-goat/pequalnp-proofs (Apache-2.0), .github/workflows/authoritative.yml
 // (its VERDICT lines and the rule that only the base branch's code judges).
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export const MAX_BYTES = 4096;
 export const CONTEXT = 'opendesk/check';
@@ -212,7 +213,14 @@ const main = () => {
   }
 };
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+// Run as a script (not imported by a test)? Compared by real path, so a path with '#', '%' or a symlink
+// still runs main(); a URL comparison would skip it silently, and exit 0 with no output.
+const isMain = () => {
+  if (!process.argv[1]) return false;
+  try { return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]); } catch { return false; }
+};
+
+if (isMain()) {
   try { main(); process.stdout.write(`VERDICT OK: ${process.argv[2]}\n`); } catch (e) {
     if (!(e instanceof Refused)) throw e;
     process.stdout.write(`REFUSED: ${e.message}\n`);

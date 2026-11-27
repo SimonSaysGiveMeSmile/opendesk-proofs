@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -119,4 +119,21 @@ test('fault: never REFUSED, even when the output also holds REFUSED lines or no 
   assert.equal(readFileSync(join(out, 'verdict'), 'utf8'), 'FAULT\n');
   assert.notEqual(render('FAULT', 'x', t).label, 'opendesk:rejected');
   assert.equal(render('REFUSED', 'x', t).label, 'opendesk:rejected');
+});
+
+// Run as a script from a folder whose name holds '#' and '%', and through a symlink: main() still runs.
+test('main runs from a path with # and %, and through a symlink', () => {
+  const base = mkdtempSync(join(tmpdir(), 'verdict-'));
+  try {
+    const odd = join(base, 'a#b%c'); mkdirSync(odd);
+    const script = join(odd, 'verdict.mjs');
+    copyFileSync(VM, script); symlinkSync(script, join(base, 'link.mjs'));
+    for (const s of [script, join(base, 'link.mjs')]) {
+      const out = dir({}), tr = dir({});
+      const r = spawnSync(process.execPath, [s, 'fault', join(tr, 'missing.out'), tr, out], { encoding: 'utf8' });
+      assert.equal(r.status, 0, r.stdout + r.stderr);
+      assert.match(r.stdout, /^VERDICT OK: fault$/m);
+      assert.equal(readFileSync(join(out, 'verdict'), 'utf8'), 'FAULT\n');
+    }
+  } finally { rmSync(base, { recursive: true, force: true }); }
 });

@@ -14,6 +14,8 @@ request that breaks one of them is refused, and the reason is the only reply.
     tools/desk.sh check <id>                          # the same checks, on your machine
     tools/desk.sh submit <id>                         # the pull request, then the desk is told
     tools/desk.sh submitted <id>                      # tell the desk again, if the submit could not
+    tools/desk.sh fix <id>                            # a refused pull request: check again on its
+                                                      #   branch, push to the same pull request
     tools/desk.sh release <id> <reason>               # give it back
     tools/desk.sh mine                                # what this clone holds
 
@@ -24,6 +26,27 @@ A submit or a release clears the job from the clone (a skeleton you gave up on i
 `.desk/put-away/`), so it never ends up in the next pull request. If the desk cannot be told about
 a pull request, the submit keeps the job and its lease and prints `tools/desk.sh submitted <id>`.
 The pull request names the gap only; it never carries the lease (whoever holds a lease can end it).
+
+`origin` must be your fork: `gh repo fork SimonSaysGiveMeSmile/opendesk-proofs --clone` makes one and
+clones it; in a clone of the upstream, `gh repo fork SimonSaysGiveMeSmile/opendesk-proofs --remote`
+renames `origin` to `upstream` and adds your fork as `origin`. `setup`, `submit` and `fix` refuse
+otherwise, before any branch is made. An SSH host alias from `~/.ssh/config`
+(`github-personal:<you>/opendesk-proofs`) is taken when GitHub knows that repository. The pull request
+names your branch as `<you>:<id>`.
+
+`check` and `submit` beat the lease every 4 minutes in the background while they run. A `STOP` from
+one of those beats (the lease is over) ends `check` with exit 3 and no pass, even when the file
+passed: release the job, do not submit it. A check passes only on the checker's own last line
+(`GUARD OK`, `ACCEPTED`), never on an exit status alone. A `state` check whose file imports
+`FormalConjecturesUtil` builds it first (`lake build FormalConjecturesUtil` in `lean/`); the first
+time takes a while.
+
+If a submit fails, it says what is where. Before the commit it switches back to your branch; once the
+file is committed it stays on the branch `<id>` (the file is committed there only), and
+`tools/desk.sh submit <id>` from there goes on. If the gap was closed meanwhile (exit 3), release it.
+After a submit, `.desk/submitted/<id>.json` keeps the gap's record. If the pull request is refused,
+edit the file on the branch `<id>` and run `tools/desk.sh fix <id>`: it checks the file again and, if
+it passes, commits it and pushes to the same branch, so the same pull request is checked again.
 
 ## The pull request
 
@@ -46,8 +69,8 @@ The pull request names the gap only; it never carries the lease (whoever holds a
    Nothing else, not `FormalConjecturesUtil`, not another problem, not another proof file.
 3. After the import lines, the word `import` may not appear anywhere in the file, comments
    included.
-4. It declares one theorem, named after the module. For `lean/OpenDesk/Outside/erdos_1.lean`
-   that is `OpenDesk.Outside.erdos_1`.
+4. It declares one theorem, named after the module. For `lean/OpenDesk/Outside/erdos1_erdos_1.lean`
+   that is `OpenDesk.Outside.erdos1_erdos_1`.
 5. The theorem's type is the type of the gap's formal-conjectures theorem, the desk's `constant`
    (for a `refute` gap, its negation `¬ (...)`). Copy it from the pinned source,
    `lean/.lake/packages/formal_conjectures/FormalConjectures/<collection>/<file>.lean`; `tools/desk.sh
@@ -62,7 +85,7 @@ The pull request names the gap only; it never carries the lease (whoever holds a
    proof cites. Other formal-conjectures or Mathlib theorems may be cited if their own proofs are
    complete.
 8. Helper lemmas and definitions go inside one namespace block named after the module:
-   `namespace OpenDesk.Outside.erdos_1` ... `end OpenDesk.Outside.erdos_1` (or `..._aux`, or a
+   `namespace OpenDesk.Outside.erdos1_erdos_1` ... `end OpenDesk.Outside.erdos1_erdos_1` (or `..._aux`, or a
    name below either). Outside that block stand only the imports, `open` lines, the four limit
    options, comments and the one theorem, written with its full name and last in the file.
    `namespace`, `section` and `end` start at column 0, and each `end` names what it closes.
@@ -95,8 +118,8 @@ These are reviewed by a person; the checks below only make the review possible.
   that text in `.desk/<id>.json` instead, and `tools/desk.sh check` runs the repository's own
   guard on the file. State the problem the source states, not an easier one.
 - `compute`, `witnesses/<id>.json`: one JSON object with `gap` (the id), `claim` (what the witness
-  shows, for example a new lower bound), `witness` (non-empty), and optionally `method` and
-  `notes`. Say how the witness can be re-checked.
+  shows, for example a new lower bound), `witness` (non-empty), `method` (the command that
+  re-checks the witness, as one string, so the reviewer can run it) and optionally `notes`.
 
 ## Which problems are gaps
 

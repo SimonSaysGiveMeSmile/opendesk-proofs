@@ -255,4 +255,11 @@ const main = () => {
   process.exit(0);
 };
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) main();
+// Run as a script (not imported by a test)? Compared by real path, so a path with '#', '%' or a symlink
+// still runs main(); a URL comparison would skip it silently, and exit 0 with no output.
+const isMain = () => {
+  if (!process.argv[1]) return false;
+  try { return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]); } catch { return false; }
+};
+
+if (isMain()) main();

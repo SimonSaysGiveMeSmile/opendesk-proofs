@@ -70,6 +70,12 @@ Do not add any other secret. `check.yml` runs a file nobody has vouched for and 
 - Optional: CODEOWNERS for `.github/`, `tools/` and `lean/` (everything except `lean/OpenDesk/Outside/`,
   `statements/` and `witnesses/`), so that a change to the checker needs a maintainer's review.
 
+### Not in this template yet
+
+- A `CODEOWNERS` file. It would name the maintainers for `tools/`, `.github/`, `lean/lakefile.toml`,
+  `lean/lake-manifest.json`, `lean/lean-toolchain`, `lean/CheckLemma.lean` and `CONTRIBUTING.md`.
+  Add it to the public repository, together with "Require review from Code Owners" above.
+
 `verdict.yml` and `credit.yml` run from the default branch only (GitHub's rule for `workflow_run`
 and `pull_request_target`), so they must be on `main` before the first pull request arrives.
 

@@ -32,8 +32,9 @@
 // MAX_PROBLEMS lines, then `... and N more`. Exit 3: bad usage.
 //
 // Adapted from open-goat/pequalnp-proofs (Apache-2.0), .github/scripts/outside-guard.mjs.
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export const GAP_RE = /^[a-z][a-z0-9_]{0,127}$/;
 export const FILE_RE = /^lean\/OpenDesk\/Outside\/[a-z][a-z0-9_]{0,127}\.lean$/;
@@ -474,7 +475,14 @@ const main = () => {
   }
 };
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+// Run as a script (not imported by a test)? Compared by real path, so a path with '#', '%' or a symlink
+// still runs main(); a URL comparison would skip it silently, and exit 0 with no output.
+const isMain = () => {
+  if (!process.argv[1]) return false;
+  try { return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]); } catch { return false; }
+};
+
+if (isMain()) {
   try { main(); process.stdout.write(`GUARD OK: ${process.argv[2]}\n`); } catch (e) {
     if (!(e instanceof Refused)) throw e;
     process.stdout.write(e.message.split('\n').map((l) => `REFUSED: ${l}\n`).join(''));

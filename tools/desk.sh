@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # desk: one command for an agent working on the open-problems desk (every formal-conjectures collection).
 #
-#   tools/desk.sh setup                check the tools and fetch the prebuilt Mathlib
+#   tools/desk.sh setup                check the tools (Node 20+, lake, gh), that origin is your fork,
+#                                      and fetch the prebuilt Mathlib
 #   tools/desk.sh next [--gap ID] [--kind check|state|compute] [--level warmup|formalize|open]
 #                      [--collection C]
 #                                      take a job from the desk (the desk picks unless --gap names one;
@@ -22,13 +23,28 @@
 #                                      state: the repository's file rules, then compile the statement
 #                                      (sorry allowed, no other axiom)
 #                                      compute: the repository's file rules and the witness's shape
-#                                      and record the sha256 of the bytes that passed
+#                                      and record the sha256 of the bytes that passed. A pass needs the
+#                                      checker's own last line (GUARD OK, ACCEPTED), not only its exit 0.
+#                                      While it runs, the lease is beaten every 4 minutes in the
+#                                      background; a STOP from that beat (the lease is over) makes the
+#                                      check end with exit 3, not a pass, even when the file passed.
+#                                      A statement that imports FormalConjecturesUtil builds it first
+#                                      (the first time takes a while).
 #   tools/desk.sh tidy <id>            only remove the comments (Lean files)
 #   tools/desk.sh submit <id>          a branch from the upstream main, one commit, one file, the pull
 #                                      request, the release; then back to your branch, the job cleared.
+#                                      origin must be your fork (gh repo fork <upstream> --remote).
 #                                      If the desk cannot be told, the job and its lease are kept here.
+#                                      If it fails, it says where things are: before the commit it
+#                                      switches back; once the file is committed it stays on the branch
+#                                      <id> (the file is there only). A record stays in
+#                                      .desk/submitted/<id>.json.
 #   tools/desk.sh submitted <id>       tell the desk again about the pull request a submit opened, when
 #                                      the submit could not (it prints this command); then the job clears
+#   tools/desk.sh fix <id>             after a pull request was refused: switch to its branch <id>, check
+#                                      the file again (with the kept record, or the desk's /step), and if
+#                                      it passes commit it and push to the same branch (the same pull
+#                                      request). Edit the file on that branch, then run fix again.
 #   tools/desk.sh release <id> <reason>
 #                                      give a job back: statement_seems_false | hypothesis_too_weak |
 #                                      missing_lemma | does_not_elaborate | source_ambiguous |
@@ -67,9 +83,176 @@ REASON_RE='^[a-z_]{1,32}$'
 PR_RE='^https://github\.com/[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}/pull/[1-9][0-9]{0,8}$'
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1 ($2)" >&2; exit 1; }; }
 dcurl() { curl --proto "$PROTO" --max-redirs 0 -m 30 "$@"; }
-field() { python3 -I -c 'import json,sys; v=json.load(open(sys.argv[1]));
+# A field of a JSON file (a.b for nested); jfield reads any file, field the state of a job here.
+jfield() { python3 -I -c 'import json,sys; v=json.load(open(sys.argv[1]));
 for k in sys.argv[2].split("."): v=v.get(k) if isinstance(v,dict) else None
-print("" if v is None else v)' "$STATE/$1.json" "$2"; }
+print("" if v is None else v)' "$1" "$2"; }
+field() { jfield "$STATE/$1.json" "$2"; }
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# WHAT RUNS IN THE BACKGROUND, AND WHAT A FAILED STEP LEAVES. One exit handler for every command: it
+# stops the background beater (no process outlives this script) and, for a submit that failed after
+# its branch was made, switches back to the starting branch and says where things are.
+BEATER=""; BEAT_NOTE=""; BEAT_STOPPED=""; STAGE=""; SWITCHED_FROM=""; SUBMIT_ID=""; SUBMIT_FILE=""; SUBMIT_PR=""
+on_exit() {
+  local rc=$?
+  stop_beater || true
+  submit_failed "$rc" || true
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# A process and everything it started (curl inside a command substitution inside a function, ...).
+kill_tree() {
+  local c
+  for c in $(pgrep -P "$1" 2>/dev/null || true); do kill_tree "$c"; done
+  kill "$1" 2>/dev/null || true
+}
+# KEEP THE LEASE ALIVE WHILE A LONG STEP RUNS: a beat every 4 minutes, in the background. It ends when
+# stop_beater is called, when this script exits (any way but SIGKILL), or when it sees this script gone.
+# A STOP (the desk says the lease is over) ends it, is printed by stop_beater and sets BEAT_STOPPED.
+start_beater() {
+  local id="$1" lease parent=$$
+  lease="$(lease_of "$id")"; BEAT_NOTE="$(mktemp)"
+  (
+    trap - EXIT INT
+    kid=""
+    trap '[ -z "$kid" ] || kill_tree "$kid"; exit 0' TERM
+    while kill -0 "$parent" 2>/dev/null; do
+      sleep 240 & kid=$!; wait "$kid" || true; kid=""
+      kill -0 "$parent" 2>/dev/null || exit 0
+      r=0; beat_once "$id" "$lease" "$BEAT_NOTE.body" >/dev/null 2>"$BEAT_NOTE.err" & kid=$!
+      wait "$kid" || r=$?; kid=""
+      if [ "$r" -eq 3 ]; then cp "$BEAT_NOTE.err" "$BEAT_NOTE"; exit 0; fi
+    done
+  ) </dev/null &
+  BEATER=$!
+}
+stop_beater() {
+  [ -n "$BEATER" ] || return 0
+  kill "$BEATER" 2>/dev/null || true; wait "$BEATER" 2>/dev/null || true; BEATER=""
+  if [ -s "$BEAT_NOTE" ]; then
+    BEAT_STOPPED=yes
+    echo "" >&2
+    echo "STOP (from the background beat while this ran): the desk says the lease is over." >&2
+    sed 's/^/  /' "$BEAT_NOTE" >&2
+  fi
+  rm -f "$BEAT_NOTE" "$BEAT_NOTE.err" "$BEAT_NOTE.body"; BEAT_NOTE=""
+}
+# A FAILED SUBMIT: one line for each thing that is where. Before the commit it switches back to the
+# branch it started on (the file, never committed, comes along). Once the file is committed on <id> it
+# stays on <id>: the file is tracked there only, and switching back would take it out of the tree.
+# Exit 3 after the branch was made (the desk says the gap is closed) is its own case: nothing to go on.
+submit_failed() {
+  local rc="$1" id="$SUBMIT_ID"
+  [ -n "$STAGE" ] && [ "$rc" -ne 0 ] || return 0
+  if [ "$rc" -eq 3 ] && [ "$STAGE" != checks ]; then STAGE="closed"; fi
+  {
+    echo "submit of $id stopped (exit $rc). Where things are:"
+    case "$STAGE" in
+      closed) echo "  the gap is closed, so no pull request was opened; $SUBMIT_FILE is kept on the branch $id here (and on origin if it was pushed)" ;;
+      checks) echo "  nothing was made: no branch, no commit, no push. Fix what is said above and submit again." ;;
+      branch) echo "  the branch $id was made here; nothing is committed or pushed" ;;
+      committed) echo "  $SUBMIT_FILE is committed on the branch $id here; nothing is pushed, no pull request" ;;
+      pushed) echo "  the branch $id is pushed to origin; no pull request was opened" ;;
+      pr) echo "  the pull request is open (${SUBMIT_PR:-its address could not be read}); the desk was not told" ;;
+    esac
+    if [ -n "$SWITCHED_FROM" ]; then
+      case "$STAGE" in
+        committed|pushed|pr) echo "  you are still on the branch $id, which holds $SUBMIT_FILE (it is committed there only, so switching back would take it out of the tree); back later: git checkout $SWITCHED_FROM" ;;
+        *) if git -C "$ROOT" checkout -q "$SWITCHED_FROM" 2>/dev/null; then echo "  switched back to $SWITCHED_FROM"
+           else echo "  could not switch back to $SWITCHED_FROM; you are still on the branch $id"; fi ;;
+      esac
+    fi
+    case "$STAGE" in
+      branch) echo "  to go on: git checkout $id; tools/desk.sh submit $id (or start over: git branch -D $id; tools/desk.sh submit $id; $SUBMIT_FILE is not on that branch)" ;;
+      committed|pushed) echo "  to go on, here on $id: tools/desk.sh submit $id" ;;
+      pr) if [ -n "$SUBMIT_PR" ]; then echo "  to tell the desk: tools/desk.sh submitted $id"; else echo "  keep the lease alive (tools/desk.sh beat $id) and ask a maintainer to record the pull request"; fi ;;
+      closed) echo "  give the job back: tools/desk.sh release $id other; then tools/desk.sh next (you may delete the branch $id, here and on your fork)" ;;
+    esac
+    case "$STAGE" in checks|closed) ;; *) echo "  the lease may still be alive; keep it: tools/desk.sh beat $id" ;; esac
+  } >&2
+  STAGE=""
+}
+# WHERE A BRANCH GOES. origin must be YOUR fork of the upstream: its owner is your GitHub login. The one
+# exception is the upstream's owner pushing a branch to the upstream itself. Sets LOGIN and HEAD_PREFIX
+# (the owner part of gh pr create --head: "<login>:" for a fork, "" for the upstream's owner).
+# A GitHub remote address as owner/name: https://github.com/o/n(.git), git@github.com:o/n(.git),
+# ssh://[git@]github.com[:22]/o/n(.git). Anything else: nothing, exit 1.
+repo_of_url() {
+  local r
+  [[ "$1" =~ ^(https://([^@/]+@)?github\.com/|git@github\.com:|ssh://(git@)?github\.com(:22)?/)([A-Za-z0-9-]{1,39})/([A-Za-z0-9._-]{1,100})/?$ ]] || return 1
+  r="${BASH_REMATCH[6]}"; r="${r%.git}"; [ -n "$r" ] || return 1
+  printf '%s/%s' "${BASH_REMATCH[5]}" "$r"
+}
+# An SSH address through a host alias of ~/.ssh/config (github-personal:o/n, me@gh-work:o/n,
+# ssh://gh-work/o/n), as owner/name; whether GitHub knows it is asked of gh (fork_check). Else exit 1.
+repo_of_alias() {
+  local r o
+  if [[ "$1" =~ ^ssh://([A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9._-]*(:[0-9]{1,5})?/([A-Za-z0-9-]{1,39})/([A-Za-z0-9._-]{1,100})/?$ ]]; then
+    o="${BASH_REMATCH[3]}"; r="${BASH_REMATCH[4]}"
+  elif [[ "$1" =~ ^([A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9._-]*:([A-Za-z0-9-]{1,39})/([A-Za-z0-9._-]{1,100})/?$ ]]; then
+    o="${BASH_REMATCH[2]}"; r="${BASH_REMATCH[3]}"
+  else return 1; fi
+  r="${r%.git}"; [ -n "$r" ] || return 1
+  printf '%s/%s' "$o" "$r"
+}
+# The decision alone, on an origin address, a login and the upstream: prints fork, upstream-owner or
+# not-yours (exit 1), or not-github (exit 2). A host alias address is read as owner/name too.
+origin_kind() {
+  local repo
+  repo="$(repo_of_url "$1" || repo_of_alias "$1")" || { echo not-github; return 2; }
+  if [ "$(lower "${repo%%/*}")" != "$(lower "$2")" ]; then echo not-yours; return 1; fi
+  if [ "$(lower "$repo")" = "$(lower "$3")" ]; then echo upstream-owner; else echo fork; fi
+}
+LOGIN=""; HEAD_PREFIX=""
+# origin's address as written in .git/config; if that is no GitHub address (an url.insteadOf shorthand),
+# the address git rewrites it to.
+origin_url() {
+  local u
+  u="$(git -C "$ROOT" config --get remote.origin.url 2>/dev/null)" || return 1
+  repo_of_url "$u" >/dev/null || u="$(git -C "$ROOT" remote get-url origin 2>/dev/null)" || return 1
+  printf '%s' "$u"
+}
+fork_check() {
+  local url k aka
+  LOGIN="$(gh api user --jq .login)" || { echo "gh is not signed in: gh auth login" >&2; exit 1; }
+  [[ "$LOGIN" =~ ^[A-Za-z0-9-]{1,39}$ ]] || { echo "the GitHub handle is not a plain login" >&2; exit 1; }
+  url="$(origin_url)" || { echo "this clone has no remote origin; run: gh repo fork $UPSTREAM --remote (it adds your fork as origin)" >&2; exit 1; }
+  k="$(origin_kind "$url" "$LOGIN" "$UPSTREAM")" || true
+  # Not a github.com address but a host alias: taken only if GitHub knows that repository.
+  if { [ "$k" = fork ] || [ "$k" = upstream-owner ]; } && ! repo_of_url "$url" >/dev/null; then
+    aka="$(repo_of_alias "$url")"
+    [ "$(lower "$(gh api "repos/$aka" --jq .full_name 2>/dev/null || true)")" = "$(lower "$aka")" ] \
+      || { echo "origin ($url) names $aka through a host alias, and GitHub does not know that repository; run: gh repo fork $UPSTREAM --remote" >&2; exit 1; }
+    echo "note: origin ($url) is a host alias; taken as github.com/$aka" >&2
+  fi
+  case "$k" in
+    fork) HEAD_PREFIX="$LOGIN:" ;;
+    upstream-owner) HEAD_PREFIX=""; echo "note: origin is $UPSTREAM itself and you ($LOGIN) own it, so the branch goes to the upstream (a maintainer's branch)" >&2 ;;
+    not-github) echo "origin ($url) is not a GitHub repository address; run: gh repo fork $UPSTREAM --remote" >&2; exit 1 ;;
+    *) echo "origin is not your fork; run: gh repo fork $UPSTREAM --remote  (it renames origin to upstream and adds your fork as origin)" >&2; exit 1 ;;
+  esac
+}
+# A pull request of yours from the branch <id> into the upstream, already open (its address, or nothing).
+existing_pr() {
+  local lo; lo="$(lower "$LOGIN")"
+  { gh pr list --repo "$UPSTREAM" --head "$1" --state open --json url,headRepositoryOwner \
+      --jq ".[] | select((.headRepositoryOwner.login | ascii_downcase) == \"$lo\") | .url" 2>/dev/null || true; } \
+    | grep -E "$PR_RE" | head -n 1 || true
+}
+# Run a checker. It passes only when it exits 0 AND its last line says so (GUARD OK, ACCEPTED): a
+# script that silently did nothing is never a pass. Its output is shown as it comes.
+must_say() {
+  local want="$1" out rc=0 last; shift
+  out="$(mktemp)"
+  "$@" | tee "$out" || rc=$?
+  last="$(tail -n 1 "$out")"; rm -f "$out"
+  [ "$rc" -eq 0 ] || return "$rc"
+  case "$last" in "$want"*) return 0 ;; esac
+  echo "REJECTED (no verdict): the checker exited 0 but did not end with its $want line; this is not a pass" >&2
+  return 1
+}
 have() {
   [[ "$1" =~ $GAP_RE ]] || { echo "not a gap id: $1" >&2; exit 1; }
   [ -f "$STATE/$1.json" ] || { echo "no such gap here: $1 (run: tools/desk.sh next; tools/desk.sh mine lists what this clone holds)" >&2; exit 1; }
@@ -79,14 +262,17 @@ lease_of() { l="$(field "$1" lease)"; [[ "$l" =~ $LEASE_RE ]] || { echo "the lea
 pr_of() { local p; p="$(field "$1" pr)"; [ -z "$p" ] || [[ "$p" =~ $PR_RE ]] || { echo "the state of $1 names a malformed pull request; refusing" >&2; exit 1; }; printf '%s' "$p"; }
 set_pr() { python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["pr"]=sys.argv[2]; json.dump(d, open(p,"w"), indent=1)' "$STATE/$1.json" "$2"; }
 # The file a job writes, by kind; anything else in the state file is refused before it is used.
+path_for() {
+  case "$2" in
+    check|refute) printf 'lean/OpenDesk/Outside/%s.lean' "$1" ;;
+    state) printf 'statements/%s.lean' "$1" ;;
+    compute) printf 'witnesses/%s.json' "$1" ;;
+    *) return 1 ;;
+  esac
+}
 file_of() {
   local f k; f="$(field "$1" gap.file)"; k="$(field "$1" gap.kind)"
-  case "$k" in
-    check|refute) [ "$f" = "lean/OpenDesk/Outside/$1.lean" ] ;;
-    state) [ "$f" = "statements/$1.lean" ] ;;
-    compute) [ "$f" = "witnesses/$1.json" ] ;;
-    *) false ;;
-  esac || { echo "the state of $1 names an unexpected file or kind; refusing" >&2; exit 1; }
+  [ -n "$f" ] && [ "$f" = "$(path_for "$1" "$k" || true)" ] || { echo "the state of $1 names an unexpected file or kind; refusing" >&2; exit 1; }
   printf '%s' "$f"
 }
 # GIVE A LEASE BACK. The desk's answer is printed cleaned. A lease the desk no longer knows (410 gone)
@@ -132,7 +318,7 @@ guard_file() {
     compute) printf '[]' > "$imp" ;;
     *) echo "guard_file: not a state or compute job" >&2; exit 1 ;;
   esac
-  node "$ROOT/.github/scripts/outside-guard.mjs" imports "$ROOT/$file" "$imp" "$file" || { echo "REJECTED (file rules): $file breaks the repository's file rules above (CONTRIBUTING.md); the pull request would be refused" >&2; exit 1; }
+  must_say "GUARD OK" node "$ROOT/.github/scripts/outside-guard.mjs" imports "$ROOT/$file" "$imp" "$file" || { echo "REJECTED (file rules): $file breaks the repository's file rules above (CONTRIBUTING.md); the pull request would be refused" >&2; exit 1; }
 }
 # IS THE GAP STILL OPEN? Asked of the desk before checking and again right before the pull request.
 # One GET, no lease, nothing sent but the gap id. open and leased go on; anything else stops with the
@@ -234,6 +420,15 @@ if re.search(r"(?m)^\s*(axiom|#exit)\b", s): bad.append("no `axiom` and no `#exi
 for b in bad: print("refused: " + b, file=sys.stderr)
 sys.exit(1 if bad else 0)
 PY
+  # `lake env lean` compiles one file against what is built already: Mathlib comes prebuilt, a
+  # formal-conjectures module does not. So each one the statement imports (FormalConjecturesUtil) is
+  # built first; the first time this takes a while, later checks find it built.
+  local m
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    echo "building $m first (the first check that imports it builds it; later ones find it built) ..."
+    (cd "$ROOT/lean" && lake build "$m" </dev/null) || { echo "REJECTED (does-not-compile): $m, which $file imports, could not be built" >&2; exit 1; }
+  done < <(sed -nE 's/^import (FormalConjectures[A-Za-z0-9_.«»]*)[[:space:]]*$/\1/p' "$ROOT/$file")
   tmp="$(mktemp -d)"; cp "$ROOT/$file" "$tmp/Statement.lean"; printf '\n#print axioms %s\n' "$thm" >> "$tmp/Statement.lean"
   echo "compiling $file with the pinned toolchain (sorry allowed) ..."
   if ! out="$(cd "$ROOT/lean" && lake env lean "$tmp/Statement.lean" 2>&1)"; then
@@ -266,6 +461,7 @@ else:
     c = d.get("claim")
     if not isinstance(c, str) or not c.strip() or c.startswith("TODO"): bad.append("\"claim\" must say what the witness shows")
     if d.get("witness") in (None, "", [], {}): bad.append("\"witness\" is empty")
+    if "method" in d and not isinstance(d.get("method"), str): bad.append("\"method\" is the command that re-checks the witness, as one string")
 for b in bad: print("refused: " + b, file=sys.stderr)
 sys.exit(1 if bad else 0)
 PY
@@ -359,7 +555,7 @@ if kind in ("state", "compute"):
             json.dump({"gap": gid, "title": title, "bounds": bounds,
                        "claim": "TODO: what this witness shows, e.g. a new lower bound",
                        "witness": None, "method": "", "notes": ""}, f, indent=2, ensure_ascii=False); f.write("\n")
-        print("FILE      ", path, "(template written; fill claim and witness)")
+        print("FILE      ", path, "(template written; fill claim and witness, and put the command that re-checks the witness in method)")
     print("GAP       ", gid, "-", kind, "job")
     if url: print("SOURCE    ", url)
     if bounds: print("BOUNDS    ", json.dumps(bounds))
@@ -540,12 +736,111 @@ print("RULE       The theorem's type must be the type of %s%s, exactly. Citing %
 PY
 }
 
+# ONE BEAT. Only an answer of the desk that the lease is over is a STOP (exit 3). No answer, a server
+# error or an answer that is not JSON says nothing about the lease: exit 4, beat again soon.
+# $3: where the desk's answer is put (a temporary file if not given).
+beat_once() {
+  local gid="$1" lease="$2" body="${3:-}" mine=no code rc=0
+  [ -n "$body" ] || { body="$(mktemp)"; mine=yes; }
+  code="$(dcurl -sS --max-filesize 100000 -o "$body" -w '%{http_code}' -X POST "$DESK/beat?lease=$lease" 2>/dev/null)" || code="000"
+  python3 -I -c 'import json,sys,re
+gid, code = sys.argv[1], sys.argv[2]
+retry = "the lease may still be alive: beat again in a minute (tools/desk.sh beat " + gid + "); it lapses 15 minutes after its last beat"
+try: d=json.load(open(sys.argv[3], encoding="utf-8"))
+except Exception: d=None
+if not re.fullmatch(r"[1-5][0-9][0-9]", code):
+    print("NO ANSWER: the desk could not be reached; " + retry, file=sys.stderr); sys.exit(4)
+if code == "200" and isinstance(d,dict) and d.get("ok") is True:
+    n=d.get("next_beat_s"); n=n if type(n) is int and 30<=n<=3600 else 300
+    print("lease of", gid, "alive; it ends at the latest", re.sub(r"[^0-9TZ:.-]", "", str(d.get("expires_at") or ""))[:40], "| next beat in", n, "s"); sys.exit(0)
+err=re.sub(r"[^a-z_]","",str(d.get("error") or ""))[:32] if isinstance(d,dict) else ""
+# The answers of lib/desk.js beat that end a lease: 410 gone (ended, lapsed, 6-hour limit),
+# 410 solved, and 400 bad_lease (a lease id the desk can never know).
+if (code, err) in (("410","gone"), ("410","solved"), ("400","bad_lease"), ("404","gone"), ("409","solved"), ("409","in_review")):
+    print("STOP: " + re.sub(r"[^ -~]", " ", str(d.get("say") or err))[:300], file=sys.stderr)
+    print("the lease is over. Clear it here: tools/desk.sh release " + gid + " other", file=sys.stderr); sys.exit(3)
+print("NO CLEAR ANSWER: the desk answered HTTP " + code + (" (" + err + ")" if err else "") + "; " + retry, file=sys.stderr); sys.exit(4)' "$gid" "$code" "$body" || rc=$?
+  [ "$mine" = no ] || rm -f "$body"
+  return "$rc"
+}
+# THE CHECK ITSELF, for check, fix: the file, its kind, and for a proof the constant, the module and a
+# JSON file of the allowed imports. Sets CHECKED_SHA, the sha256 of the bytes that passed.
+CHECKED_SHA=""
+run_check() {
+  local id="$1" file="$2" kind="$3" built
+  [ -f "$ROOT/$file" ] || { echo "no file $file yet" >&2; exit 1; }
+  if [ "$kind" = check ] || [ "$kind" = refute ]; then tidy "$ROOT/$file"; fi
+  size_ok "$file"; built="$(sha < "$ROOT/$file")"
+  case "$kind" in
+  state) check_state "$id" "$file" ;;
+  compute) check_compute "$id" "$file" ;;
+  *)
+    # The public guard first (cheap), then the checker itself (it builds the file and judges it).
+    must_say "GUARD OK" node "$ROOT/.github/scripts/outside-guard.mjs" imports "$ROOT/$file" "$6" "$file" || exit 1
+    must_say "ACCEPTED" node "$ROOT/tools/check-lean.mjs" "$ROOT/$file" "$4" "$5" "$kind" || exit $?
+    ;;
+  esac
+  [ "$(sha < "$ROOT/$file")" = "$built" ] || { echo "$file changed while it was checked; run check again" >&2; exit 1; }
+  CHECKED_SHA="$built"
+}
+# THE RECORD A SUBMIT KEEPS (.desk/submitted/<id>.json), so fix can check the file again after the job
+# left this clone: id, constant, module, imports, kind, file, pr.
+keep_record() {
+  mkdir -p "$STATE/submitted"
+  python3 -I -c 'import json,sys
+g=json.load(open(sys.argv[1]))["gap"]
+json.dump({"id": g["id"], "constant": g.get("constant"), "module": g.get("module"), "imports": g.get("imports"),
+           "kind": g["kind"], "file": g["file"], "pr": sys.argv[3]}, open(sys.argv[2], "w"), indent=1)' "$STATE/$1.json" "$STATE/submitted/$1.json" "$2"
+}
+# No record here (another clone made the pull request): the desk's GET /step names the gap's file and,
+# for a proof, its constant, module and imports. Checked against strict patterns; the checker checks
+# the constant and the module again before anything is built.
+fetch_record() {
+  local ans
+  echo "desk: $DESK step (no record of $1 is kept here)" >&2
+  ans="$(dcurl -fsS -m 15 -G "$DESK/step" --data-urlencode "gap=$1")" || { echo "the desk could not be asked about $1, and no record of its submit is kept here; try again" >&2; exit 1; }
+  mkdir -p "$STATE/submitted"
+  printf '%s' "$ans" | python3 -I -c 'import json,sys,re
+gid, out, pr_re = sys.argv[1], sys.argv[2], sys.argv[3]
+try: d = json.load(sys.stdin)
+except Exception: print("the desk did not answer with JSON", file=sys.stderr); sys.exit(1)
+g = d.get("gap") if isinstance(d, dict) else None
+if not isinstance(g, dict) or g.get("id") != gid: print("the desk does not know the gap %s" % gid, file=sys.stderr); sys.exit(1)
+kind = g.get("kind")
+files = {"check": "lean/OpenDesk/Outside/%s.lean", "refute": "lean/OpenDesk/Outside/%s.lean", "state": "statements/%s.lean", "compute": "witnesses/%s.json"}
+if kind not in files or g.get("file") != files[kind] % gid: print("the desk named an unexpected kind or file for %s; refusing" % gid, file=sys.stderr); sys.exit(1)
+rec = {"id": gid, "constant": None, "module": None, "imports": None, "kind": kind, "file": g["file"], "pr": ""}
+if kind in ("check", "refute"):
+    c, m, imps = g.get("constant"), g.get("module"), g.get("imports") or ["Mathlib", g.get("module")]
+    if not (isinstance(c, str) and re.fullmatch(r"[^\s\"\\\x00-\x1f\x7f]{3,300}", c)
+            and isinstance(m, str) and re.fullmatch(r"FormalConjectures(\.(«[A-Za-z0-9_.]+»|[A-Za-z_][A-Za-z0-9_\x27]*)){1,8}", m)
+            and isinstance(imps, list) and all(isinstance(x, str) and (x == m or re.fullmatch(r"Mathlib(\.[A-Za-z][A-Za-z0-9_]*)*", x)) for x in imps)):
+        print("the desk named a constant, module or imports of an unexpected shape; refusing", file=sys.stderr); sys.exit(1)
+    rec.update(constant=c, module=m, imports=imps)
+rv = d.get("review") if isinstance(d.get("review"), dict) else {}
+if isinstance(rv.get("pr"), str) and re.fullmatch(pr_re, rv["pr"]): rec["pr"] = rv["pr"]
+json.dump(rec, open(out, "w"), indent=1)' "$1" "$STATE/submitted/$1.json" "$PR_RE" || exit 1
+}
+# Sourced (by the tests, .github/scripts/desk.test.mjs): the functions only, no command runs.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 case "${1:-help}" in
 setup)
   need git "https://git-scm.com"; need curl "curl"; need python3 "python 3"; need node "Node.js 20 or later"
+  nmajor="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+  [[ "$nmajor" =~ ^[0-9]+$ ]] && [ "$nmajor" -ge 20 ] || { echo "Node.js is $(node --version 2>/dev/null || echo unknown); the checker needs Node.js 20 or later" >&2; exit 1; }
   need gh "the GitHub CLI, https://cli.github.com, then: gh auth login"
+  if ! command -v lake >/dev/null 2>&1 && [ -x "$HOME/.elan/bin/lake" ]; then
+    echo "lake is installed (~/.elan/bin/lake) but not on your PATH; run: source ~/.elan/env (or add ~/.elan/bin to PATH), then tools/desk.sh setup again" >&2; exit 1
+  fi
   need lake "Lean: install elan from https://github.com/leanprover/elan"
   gh api user --jq .login >/dev/null || { echo "gh is not signed in: gh auth login" >&2; exit 1; }
+  fork_check
+  echo "origin: $(origin_url); pull requests go to $UPSTREAM"
+  # A push over https needs git to take gh's sign-in. A warning, not a failure: another helper may work.
+  if [[ "$(origin_url)" == https://* ]] \
+     && ! git -C "$ROOT" config --get-urlmatch credential.helper https://github.com 2>/dev/null | grep -q 'gh'; then
+    echo "warning: git's credential helper for github.com is not gh, so a push over https may fail; run: gh auth setup-git" >&2
+  fi
   (cd "$ROOT/lean" && lake exe cache get)
   echo "ready. Next: tools/desk.sh next"
   ;;
@@ -566,12 +861,31 @@ next)
   [ -n "$kind" ] && args+=(--data-urlencode "kind=$kind")
   [ -n "$level" ] && args+=(--data-urlencode "level=$level")
   [ -n "$collection" ] && args+=(--data-urlencode "collection=$collection")
-  dcurl -fsS --max-filesize 1000000 "${args[@]}" > "$STATE/.last.json" || { echo "the desk refused; its answer:" >&2; dcurl -sS --max-filesize 100000 "${args[@]}" | python3 -I -c 'import json,sys,re
+  # ONE request: taking a job is not idempotent, so an error is read from the same answer, never asked again.
+  # curl's status is kept apart from the HTTP status it printed: a 200 whose body was cut off has leased.
+  rm -f "$STATE/.last.json"; crc=0
+  code="$(dcurl -sS --max-filesize 1000000 -o "$STATE/.last.json" -w '%{http_code}' "${args[@]}")" || crc=$?
+  [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] || code="000"
+  if [ "$code" != 200 ] || [ "$crc" -ne 0 ]; then
+    if [ "$crc" -ne 0 ] && [[ "$code" == 2* ]]; then
+      echo "the desk answered (HTTP $code) but its answer was cut off (curl exit $crc). A lease may now be held for you: it is not recorded here (tools/desk.sh mine does not list it), and it lapses 15 minutes after it was handed out. Try again after that." >&2
+    elif [ "$code" = 000 ]; then
+      # 6, 7: no such host, no connection; 35, 60: the TLS handshake failed. Then nothing reached the desk.
+      case "$crc" in
+        6|7|35|60) echo "the desk could not be reached (no answer, curl exit $crc); nothing was taken. Try again in a minute." >&2 ;;
+        *) echo "the desk gave no answer (curl exit $crc) after the request was sent; a job may have been taken for you. It is not recorded here, and its lease lapses 15 minutes after it was handed out. Try again after that." >&2 ;;
+      esac
+    else
+      echo "the desk refused (HTTP $code); its answer:" >&2
+      { head -c 100000 "$STATE/.last.json" 2>/dev/null || true; } | python3 -I -c 'import json,sys,re
 raw=sys.stdin.read(100000)
 try: d=json.loads(raw); t=(str(d.get("error") or "")+": "+str(d.get("say") or "")) if isinstance(d,dict) else raw
-except Exception: t=raw
+except Exception: t=raw or "(empty)"
 print(re.sub(r"[^ -~]", " ", t)[:600])' >&2
-    compgen -G "$STATE/*.json" >/dev/null && echo "jobs this clone holds: tools/desk.sh mine" >&2; exit 1; }
+    fi
+    rm -f "$STATE/.last.json"
+    compgen -G "$STATE/*.json" >/dev/null && echo "jobs this clone holds: tools/desk.sh mine" >&2; exit 1
+  fi
   rm -f "$STATE/.refused"; rc=0
   python3 -I -c "$(next_py)" "$STATE" "$ROOT" "$FC_DIR" "$want" "$kind" || rc=$?
   [ "$rc" -eq 0 ] && rm -f "$STATE/.refused"
@@ -586,35 +900,16 @@ print(re.sub(r"[^ -~]", " ", t)[:600])' >&2
   ;;
 beat)
   stop_check
-  have "${2:-}"; lease="$(lease_of "$2")"; body="$(mktemp)"
-  # Only an answer of the desk that the lease is over is a STOP (exit 3). No answer, a server error or
-  # an answer that is not JSON says nothing about the lease: exit 4, beat again soon.
-  code="$(dcurl -sS --max-filesize 100000 -o "$body" -w '%{http_code}' -X POST "$DESK/beat?lease=$lease" 2>/dev/null)" || code="000"
-  rc=0; python3 -I -c 'import json,sys,re
-gid, code = sys.argv[1], sys.argv[2]
-retry = "the lease may still be alive: beat again in a minute (tools/desk.sh beat " + gid + "); it lapses 15 minutes after its last beat"
-try: d=json.load(open(sys.argv[3], encoding="utf-8"))
-except Exception: d=None
-if not re.fullmatch(r"[1-5][0-9][0-9]", code):
-    print("NO ANSWER: the desk could not be reached; " + retry, file=sys.stderr); sys.exit(4)
-if code == "200" and isinstance(d,dict) and d.get("ok") is True:
-    n=d.get("next_beat_s"); n=n if type(n) is int and 30<=n<=3600 else 300
-    print("lease of", gid, "alive; it ends at the latest", re.sub(r"[^0-9TZ:.-]", "", str(d.get("expires_at") or ""))[:40], "| next beat in", n, "s"); sys.exit(0)
-err=re.sub(r"[^a-z_]","",str(d.get("error") or ""))[:32] if isinstance(d,dict) else ""
-# The answers of lib/desk.js beat that end a lease: 410 gone (ended, lapsed, 6-hour limit),
-# 410 solved, and 400 bad_lease (a lease id the desk can never know).
-if (code, err) in (("410","gone"), ("410","solved"), ("400","bad_lease"), ("404","gone"), ("409","solved"), ("409","in_review")):
-    print("STOP: " + re.sub(r"[^ -~]", " ", str(d.get("say") or err))[:300], file=sys.stderr)
-    print("the lease is over. Clear it here: tools/desk.sh release " + gid + " other", file=sys.stderr); sys.exit(3)
-print("NO CLEAR ANSWER: the desk answered HTTP " + code + (" (" + err + ")" if err else "") + "; " + retry, file=sys.stderr); sys.exit(4)' "$2" "$code" "$body" || rc=$?
-  rm -f "$body"; exit "$rc"
+  have "${2:-}"; lease="$(lease_of "$2")"
+  rc=0; beat_once "$2" "$lease" || rc=$?
+  exit "$rc"
   ;;
 mine)
   n=0
   for f in "$STATE"/*.json; do
     [ -e "$f" ] || continue; id="$(basename "$f" .json)"; [[ "$id" =~ $GAP_RE ]] || continue; n=$((n + 1))
     file="$(field "$id" gap.file)"; k="$(field "$id" gap.kind)"
-    st="$(dcurl -fsS -m 10 -G "$DESK/step" --data-urlencode "gap=$id" 2>/dev/null | python3 -I -c 'import json,sys,re
+    st="$({ dcurl -fsS -m 10 -G "$DESK/step" --data-urlencode "gap=$id" 2>/dev/null || true; } | python3 -I -c 'import json,sys,re
 try: d=json.load(sys.stdin); print(re.sub(r"[^a-z_]","",str(d.get("state")))[:20])
 except Exception: print("unknown")' || echo unknown)"
     fs="no file"
@@ -629,21 +924,18 @@ except Exception: print("unknown")' || echo unknown)"
 check)
   have "${2:-}"; id="$2"; file="$(file_of "$id")"; kind="$(field "$id" gap.kind)"; rm -f "$STATE/$id.checked"; still_open "$id"
   [ -f "$ROOT/$file" ] || { echo "no file $file yet" >&2; exit 1; }
-  if [ "$kind" = check ] || [ "$kind" = refute ]; then tidy "$ROOT/$file"; fi
-  size_ok "$file"; built="$(sha < "$ROOT/$file")"
-  case "$kind" in
-  state) check_state "$id" "$file" ;;
-  compute) check_compute "$id" "$file" ;;
-  *)
-    # The public guard first (cheap), then the checker itself (it builds the file and judges it).
-    imp="$STATE/$id.imports.json"
+  imp="$STATE/$id.imports.json"
+  if [ "$kind" = check ] || [ "$kind" = refute ]; then
     python3 -I -c 'import json,sys; json.dump(json.load(open(sys.argv[1]))["gap"]["imports"], open(sys.argv[2],"w"))' "$STATE/$id.json" "$imp"
-    node "$ROOT/.github/scripts/outside-guard.mjs" imports "$ROOT/$file" "$imp" "$file" || exit 1
-    node "$ROOT/tools/check-lean.mjs" "$ROOT/$file" "$(field "$id" gap.constant)" "$(field "$id" gap.module)" "$kind" || exit $?
-    ;;
-  esac
-  [ "$(sha < "$ROOT/$file")" = "$built" ] || { echo "$file changed while it was checked; run check again" >&2; exit 1; }
-  printf '%s %s\n' "$built" "$file" > "$STATE/$id.checked"
+  fi
+  start_beater "$id"
+  run_check "$id" "$file" "$kind" "$(field "$id" gap.constant)" "$(field "$id" gap.module)" "$imp"
+  stop_beater
+  # A STOP from the background beat: the file passed, but the lease is over, so it is not to be sent.
+  if [ -n "$BEAT_STOPPED" ]; then
+    echo "STOP: $file passed, but the lease is over, so do not submit it. Clear it: tools/desk.sh release $id other; then tools/desk.sh next" >&2; exit 3
+  fi
+  printf '%s %s\n' "$CHECKED_SHA" "$file" > "$STATE/$id.checked"
   echo "passed on this machine. The pull request is checked again by the repository's own run. Next: tools/desk.sh submit $id"
   ;;
 tidy)
@@ -663,6 +955,8 @@ submit)
     grep -q 'sorry' "$ROOT/$file" && { echo "$file still contains sorry" >&2; exit 1; }
   fi
   cd "$ROOT"
+  # The branch goes to YOUR fork: checked before any branch or commit is made.
+  fork_check
   # ONLY THIS JOB'S FILE GOES IN. A change to a tracked file, or anything staged, is refused. Other
   # untracked files (another job's skeleton) stay where they are and out of the pull request.
   other="$(git diff --name-only HEAD -- | grep -vxF -- "$file" || true)"
@@ -670,19 +964,23 @@ submit)
   extra="$(git ls-files --others --exclude-standard | grep -vxF -- "$file" || true)"
   [ -z "$extra" ] || echo "note: $(printf '%s\n' "$extra" | wc -l | tr -d ' ') other untracked file(s) stay out of this pull request" >&2
   start="$(git symbolic-ref -q --short HEAD || git rev-parse HEAD)"
+  SUBMIT_ID="$id"; SUBMIT_FILE="$file"; STAGE="checks"
+  start_beater "$id"
   git fetch -q "https://github.com/$UPSTREAM.git" main
   up="$(git rev-parse FETCH_HEAD)"
   if git cat-file -e "$up:$file" 2>/dev/null; then
-    echo "This gap was just done by someone else, and a recorded result is final, so this one cannot be sent. You did nothing wrong. Clear it: tools/desk.sh release $id other; then tools/desk.sh next" >&2; exit 1
+    STAGE=""; echo "This gap was just done by someone else, and a recorded result is final, so this one cannot be sent. You did nothing wrong. Clear it: tools/desk.sh release $id other; then tools/desk.sh next" >&2; exit 1
   fi
   # The branch starts at the upstream main, so it carries nothing from an earlier pull request.
   if [ "$start" != "$id" ]; then
     if git show-ref -q --verify "refs/heads/$id"; then
-      echo "not submitted: a branch $id exists from an earlier try. Continue on it (git checkout $id; tools/desk.sh submit $id) or delete it (git branch -D $id)" >&2; exit 1
+      STAGE=""; echo "not submitted: a branch $id exists from an earlier try. Continue on it (git checkout $id; tools/desk.sh submit $id) or delete it (git branch -D $id)" >&2; exit 1
     fi
-    git checkout -q -b "$id" "$up"
+    git checkout -q -b "$id" "$up"; SWITCHED_FROM="$start"
   fi
+  STAGE="branch"
   git add -- "$file"; git diff --cached --quiet || git commit -q -m "$id" -- "$file"
+  STAGE="committed"
   git cat-file blob "HEAD:$file" | is_checked "$id" "$file" || { echo "not submitted: the committed $file is not the file that was checked (git or a hook changed it)" >&2; exit 1; }
   # ONE NEW FILE, NOTHING ELSE: the pull request's diff against the upstream main adds exactly this file.
   base="$(git merge-base "$up" HEAD)"
@@ -691,8 +989,11 @@ submit)
     echo "refused: a pull request adds exactly one new file, $file, and changes nothing on main." >&2
     echo "this pull request would change:" >&2; echo "$changed" >&2; exit 1
   fi
-  git push -q -u origin "$id"
+  git push -q -u origin "$id" || { echo "the push to origin failed (for a push over https: gh auth setup-git)" >&2; exit 1; }
+  STAGE="pushed"
   lease="$(lease_of "$id")"
+  stop_beater
+  # A STOP from the background beat is checked again below (still_open, the beat right before the pull request).
   still_open "$id"
   # Renew the lease right before the pull request: if the desk says the gap was solved meanwhile, the
   # pull request would be refused; stop. If the desk cannot be reached, go on.
@@ -704,15 +1005,39 @@ if isinstance(d, dict) and (d.get("withdrawn") is True or d.get("error") == "sol
 if isinstance(d, dict) and d.get("ok") is not True:
     print("note: the lease is over (" + re.sub(r"[^ -~]", " ", str(d.get("say") or d.get("error") or ""))[:200] + "); the pull request is still sent", file=sys.stderr)' || exit 3
   # The lease is a bearer token (whoever holds it can end the hold): it never goes in the pull request.
-  pr="$(gh pr create --repo "$UPSTREAM" --title "$id" --body "Gap: $id ($kind), sent with tools/desk.sh.")"
-  pr="$(printf '%s' "$pr" | tr -cd '[:print:]\n' | grep -Eo 'https://[A-Za-z0-9./_-]+' | tail -n 1 || true)"
+  # --head names the branch on your fork (<login>:<id>), so gh never has to guess where it is.
+  # The body is .github/PULL_REQUEST_TEMPLATE.md filled in. It is not read by any check.
+  what=""
+  if [ "$kind" = check ] || [ "$kind" = refute ]; then what=" (a proof of \`$(field "$id" gap.constant)\`)"; fi
+  body="**Gap id**: \`$id\`
+
+**Kind**: \`$kind\`
+
+**The one file**: \`$file\`$what
+
+- [x] adds exactly that one file and edits no other file
+- [x] \`tools/desk.sh check $id\` passed locally
+
+Sent with tools/desk.sh. The description of a pull request is not read by the checker. Only the one file is judged."
+  if ! out="$(gh pr create --repo "$UPSTREAM" --head "$HEAD_PREFIX$id" --title "$id" --body "$body" 2>&1)"; then
+    # A pull request from this branch may be open already (an earlier submit that stopped after it).
+    pr="$(existing_pr "$id")"
+    [ -n "$pr" ] || { echo "gh pr create failed: $(printf '%s' "$out" | tr -cd '[:print:]\n' | tail -n 5)" >&2; exit 1; }
+    echo "a pull request from $HEAD_PREFIX$id is open already: $pr (recorded)" >&2
+  else
+    pr="$(printf '%s' "$out" | tr -cd '[:print:]\n' | grep -Eo 'https://[A-Za-z0-9./_-]+' | tail -n 1 || true)"
+  fi
   [[ "$pr" =~ $PR_RE ]] || pr=""
+  STAGE="pr"; SUBMIT_PR="$pr"
+  # Recorded at once, so tools/desk.sh submitted <id> works whatever happens next.
+  if [ -n "$pr" ]; then set_pr "$id" "$pr"; fi
+  keep_record "$id" "$pr"
   printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$id" "${pr:-?}" >> "$STATE/submitted.log"
   told=yes; release_lease "$lease" submitted "$pr" || told=no
   if [ "$start" != "$id" ]; then git checkout -q "$start"; fi
+  STAGE=""
   if [ "$told" = no ]; then
     # The job and its lease stay here, with the pull request's address, so the desk can be told later.
-    if [ -n "$pr" ]; then set_pr "$id" "$pr"; fi
     echo "submitted ${pr:-(the address of the pull request could not be read)}, but the desk was NOT told, so it does not yet hold the gap for your review." >&2
     if [ -n "$pr" ]; then echo "The job and its lease are kept here. Tell the desk within 15 minutes of the last beat: tools/desk.sh submitted $id" >&2
     else echo "The job and its lease are kept here. Keep the lease alive (tools/desk.sh beat $id) and ask a maintainer to record the pull request." >&2; fi
@@ -723,7 +1048,68 @@ if isinstance(d, dict) and d.get("ok") is not True:
     state|compute) echo "submitted ${pr:-}. A person reviews $kind jobs; the result shows on the pull request." ;;
     *) echo "submitted ${pr:-}. The repository's checks run on the pull request (gh pr checks ${pr:-<url>}); on ACCEPTED it is merged and credited to you." ;;
   esac
+  echo "If it is refused: edit the file on the branch $id and run tools/desk.sh fix $id (same pull request)."
   echo "Next: tools/desk.sh next"
+  ;;
+fix)
+  # A REFUSED PULL REQUEST, FIXED IN PLACE: the same branch, the same pull request, checked here first.
+  stop_check
+  id="${2:-}"; [[ "$id" =~ $GAP_RE ]] || { echo "not a gap id: $id" >&2; exit 1; }
+  cd "$ROOT"
+  rec="$STATE/submitted/$id.json"
+  [ -f "$rec" ] || fetch_record "$id"
+  kind="$(jfield "$rec" kind)"; file="$(jfield "$rec" file)"; pr="$(jfield "$rec" pr)"
+  [ -n "$file" ] && [ "$file" = "$(path_for "$id" "$kind" || true)" ] || { echo "the record of $id names an unexpected file or kind; refusing (remove $rec to ask the desk instead)" >&2; exit 1; }
+  [ -z "$pr" ] || [[ "$pr" =~ $PR_RE ]] || pr=""
+  fork_check
+  other="$(git diff --name-only HEAD -- | grep -vxF -- "$file" || true)"
+  [ -z "$other" ] || { echo "not fixed: tracked files are changed; fix sends only $file. Commit, stash or undo these first:" >&2; echo "$other" >&2; exit 1; }
+  start="$(git symbolic-ref -q --short HEAD || git rev-parse HEAD)"
+  if [ "$start" != "$id" ]; then
+    if ! git show-ref -q --verify "refs/heads/$id"; then
+      git fetch -q origin "$id:refs/heads/$id" || { echo "no branch $id here or on origin; was $id submitted from this fork?" >&2; exit 1; }
+    fi
+    git checkout -q "$id" || { echo "could not switch to the branch $id (a change here is in the way?); you are still on $start" >&2; exit 1; }
+    echo "switched to the branch $id (the branch of ${pr:-the pull request})"
+  fi
+  [ -f "$ROOT/$file" ] || { echo "the branch $id has no $file; refusing" >&2; exit 1; }
+  # A commit an earlier fix made but could not push is sent too (after the check).
+  remote="$(git ls-remote origin "refs/heads/$id" 2>/dev/null | cut -f1 || true)"
+  unpushed=no; [ "$remote" = "$(git rev-parse HEAD)" ] || unpushed=yes
+  if [ "$unpushed" = no ] && git ls-files --error-unmatch -- "$file" >/dev/null 2>&1 && git diff --quiet HEAD -- "$file"; then
+    echo "nothing to send: $file is what the pull request has. Edit it here (on the branch $id), then run tools/desk.sh fix $id again."
+    exit 0
+  fi
+  imp="$STATE/submitted/$id.imports.json"
+  if [ "$kind" = check ] || [ "$kind" = refute ]; then
+    python3 -I -c 'import json,sys; json.dump(json.load(open(sys.argv[1]))["imports"], open(sys.argv[2],"w"))' "$rec" "$imp"
+  fi
+  # A lease is held only if the desk was never told of the pull request; then keep it alive meanwhile.
+  [ ! -f "$STATE/$id.json" ] || start_beater "$id"
+  run_check "$id" "$file" "$kind" "$(jfield "$rec" constant)" "$(jfield "$rec" module)" "$imp"
+  rm -f "$imp" "$STATE/$id.guard.json"
+  stop_beater
+  if [ -n "$BEAT_STOPPED" ]; then
+    echo "STOP: $file passed, but the lease is over, so the desk will not record this pull request; nothing was committed or pushed. Clear it: tools/desk.sh release $id other" >&2; exit 3
+  fi
+  if [ "$kind" = check ] || [ "$kind" = refute ]; then
+    grep -q 'sorry' "$ROOT/$file" && { echo "$file still contains sorry" >&2; exit 1; }
+  fi
+  git add -- "$file"
+  if git diff --cached --quiet; then
+    [ "$unpushed" = yes ] || { echo "nothing to send: after the check, $file is what the pull request has."; exit 0; }
+  else
+    git commit -q -m "$id: fix" -- "$file"
+  fi
+  [ "$(git cat-file blob "HEAD:$file" | sha)" = "$CHECKED_SHA" ] || { echo "not sent: the committed $file is not the file that was checked (git or a hook changed it); the commit is on $id, not pushed" >&2; exit 1; }
+  git fetch -q "https://github.com/$UPSTREAM.git" main
+  changed="$(git diff --name-status "$(git merge-base FETCH_HEAD HEAD)" HEAD)"
+  if [ "$changed" != "A	$file" ]; then
+    echo "not sent: the branch $id would change more than the one new file $file:" >&2; echo "$changed" >&2
+    echo "the commit is on $id, not pushed" >&2; exit 1
+  fi
+  git push -q origin "$id" || { echo "the push to origin failed; the commit is on $id, not pushed (for a push over https: gh auth setup-git). Run tools/desk.sh fix $id again" >&2; exit 1; }
+  echo "pushed the fixed $file to $id; ${pr:-the pull request} is checked again (gh pr checks ${pr:-$id})."
   ;;
 submitted)
   # The desk call of a submit that failed, sent again with the pull request's address the submit kept.
@@ -742,5 +1128,6 @@ release)
   ;;
 *)
   awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+  case "${1:-help}" in help|-h|--help) ;; *) echo "unknown command: $1" >&2; exit 1 ;; esac
   ;;
 esac
